@@ -67,6 +67,13 @@ func (c *Client) MarkPublished(avxCertID string) {
 	c.publishedIDs[avxCertID] = struct{}{}
 }
 
+// MarkUnpublished removes the cert with the given avx_cert_id from the
+// published set. Used after a renewal so that the replaced cert's AVX ID
+// is not processed again as a revocation target.
+func (c *Client) MarkUnpublished(avxCertID string) {
+	delete(c.publishedIDs, avxCertID)
+}
+
 // IsPublished reports whether the cert with the given avx_cert_id is already
 // tracked as published.
 func (c *Client) IsPublished(avxCertID string) bool {

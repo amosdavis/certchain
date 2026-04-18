@@ -501,6 +501,123 @@ func (w *world) theCertIsNotFound() error {
 	return nil
 }
 
+// Auto-renewal steps.
+
+// theExpiryMonitorRunsAtWallTime simulates the CM-02 expiry enforcement goroutine.
+// For each active cert with not_after <= wallTime, it emits a TxCertRevoke block.
+func (w *world) theExpiryMonitorRunsAtWallTime(wallTime int64) {
+	for _, rec := range w.certStore.List(true) {
+		if rec.NotAfter > wallTime {
+			continue
+		}
+		if err := w.buildAndApplyRevoke(rec.CertID, wallTime); err != nil {
+			w.lastErr = err
+			return
+		}
+	}
+}
+
+// avxReportsARenewalForCNValidFromToAtBlockTime simulates the AVX renewal detection
+// in avxPollLoop: detect same-CN cert, emit TxCertPublish (new cert) then TxCertRenew.
+func (w *world) avxReportsARenewalForCNValidFromToAtBlockTime(cn string, notBefore, notAfter, blockTime int64) {
+	oldRec, hasOld := w.certStore.GetByCN(cn)
+	if !hasOld {
+		w.lastErr = errors.New("no active cert for CN — cannot simulate AVX renewal")
+		return
+	}
+	oldCertID := oldRec.CertID
+
+	// New cert_id is seeded from renewal params so it differs from the old cert.
+	newSeed := fmt.Sprintf("renewed-%s-%d-%d", cn, notBefore, notAfter)
+	w.altCertID = sha256.Sum256([]byte(newSeed))
+
+	pubPayload, err := chain.MarshalPublish(&chain.CertPublishPayload{
+		CertID:    w.altCertID,
+		CN:        cn,
+		AVXCertID: fmt.Sprintf("AVX-renewed-%s", cn),
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+		SANs:      []string{cn},
+		Serial:    "02",
+	})
+	if err != nil {
+		w.lastErr = err
+		return
+	}
+	pubTx := chain.Transaction{
+		Type:       chain.TxCertPublish,
+		NodePubkey: w.identity.PublicKey,
+		Timestamp:  blockTime,
+		Nonce:      w.nextNonce(),
+		Payload:    pubPayload,
+	}
+	chain.Sign(&pubTx, w.identity)
+	tip := w.ch.Tip()
+	pubBlk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: blockTime,
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{pubTx},
+	}
+	pubBlk.Hash = chain.ComputeHash(&pubBlk)
+	if err := w.ch.AddBlock(pubBlk); err != nil {
+		w.lastErr = err
+		return
+	}
+	if err := w.certStore.ApplyBlock(pubBlk); err != nil {
+		w.lastErr = err
+		return
+	}
+
+	renewPayload, err := chain.MarshalRenew(&chain.CertRenewPayload{
+		OldCertID: oldCertID,
+		NewCertID: w.altCertID,
+	})
+	if err != nil {
+		w.lastErr = err
+		return
+	}
+	renewTx := chain.Transaction{
+		Type:       chain.TxCertRenew,
+		NodePubkey: w.identity.PublicKey,
+		Timestamp:  blockTime,
+		Nonce:      w.nextNonce(),
+		Payload:    renewPayload,
+	}
+	chain.Sign(&renewTx, w.identity)
+	tip = w.ch.Tip()
+	renewBlk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: blockTime,
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{renewTx},
+	}
+	renewBlk.Hash = chain.ComputeHash(&renewBlk)
+	if err := w.ch.AddBlock(renewBlk); err != nil {
+		w.lastErr = err
+		return
+	}
+	w.lastErr = w.certStore.ApplyBlock(renewBlk)
+	// Save old cert ID for "the old cert has status" assertion.
+	w.lastCertID = oldCertID
+}
+
+// theNewCertForHasStatus checks the status of the renewed cert for a given CN.
+func (w *world) theNewCertForHasStatus(cn, expectedStatus string) error {
+	// The renewed cert takes over the CN index entry.
+	rec, ok := w.certStore.GetByCN(cn)
+	if !ok {
+		rec, ok = w.certStore.GetByID(w.altCertID)
+		if !ok {
+			return fmt.Errorf("new cert for %q not found", cn)
+		}
+	}
+	if string(rec.Status) != expectedStatus {
+		return fmt.Errorf("new cert for %q status = %q, want %q", cn, rec.Status, expectedStatus)
+	}
+	return nil
+}
+
 // ---- godog wiring ----
 
 func InitializeScenario(ctx *godog.ScenarioContext) {
@@ -545,7 +662,10 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^I query the cert store by cert_id of "([^"]+)"$`, w.iQueryTheCertStoreByCertIDOf)
 	ctx.Step(`^the result has status "([^"]+)"$`, w.theResultHasStatus)
 	ctx.Step(`^the result CN is "([^"]+)"$`, w.theResultCNIs)
-	ctx.Step(`^the cert is not found$`, w.theCertIsNotFound)
+	// Auto-renewal.
+	ctx.Step(`^the expiry monitor runs at wall time (\d+)$`, w.theExpiryMonitorRunsAtWallTime)
+	ctx.Step(`^AVX reports a renewal for CN "([^"]+)" valid from (\d+) to (\d+) at block time (\d+)$`, w.avxReportsARenewalForCNValidFromToAtBlockTime)
+	ctx.Step(`^the new cert for "([^"]+)" has status "([^"]+)"$`, w.theNewCertForHasStatus)
 }
 
 func TestBDD(t *testing.T) {

@@ -133,7 +133,9 @@ func main() {
 	}
 }
 
-// avxPollLoop polls AppViewX and publishes new/revoked certs to the chain.
+// avxPollLoop polls AppViewX and publishes new/revoked/renewed certs to the chain.
+// It also enforces certificate expiry (CM-02): any active cert whose not_after
+// has passed is auto-revoked via TxCertRevoke.
 func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string) {
 	var nonce uint32
 	// Resume nonce from chain to avoid replay (monotonic per-node).
@@ -158,12 +160,19 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			continue
 		}
 
+		// renewedOldAVXIDs tracks old AVX cert IDs superseded by a TxCertRenew this
+		// cycle so that we do not also emit a separate TxCertRevoke for them.
+		renewedOldAVXIDs := make(map[string]struct{})
+
 		for _, c := range result.NewCerts {
+			// Check if this is a renewal: same CN already has an active cert.
+			oldRec, isRenewal := certStore.GetByCN(c.CommonName)
+
 			nonce++
-			blk, err := buildPublishBlock(ch, id, nonce, c, configDir, client)
+			blk, certID, err := buildPublishBlock(ch, id, nonce, c, configDir, client)
 			if err != nil {
 				log.Printf("certd: build publish block for %s: %v", c.CommonName, err)
-				nonce-- // roll back nonce on error
+				nonce--
 				continue
 			}
 			if err := ch.AddBlock(blk); err != nil {
@@ -177,9 +186,38 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			client.MarkPublished(c.AVXCertID)
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
+
+			// If this is a renewal, emit TxCertRenew linking old → new cert_id.
+			// TxCertRenew sets the old cert's status to "replaced", so no separate
+			// TxCertRevoke is needed for the old cert.
+			if isRenewal {
+				nonce++
+				renewBlk, err := buildRenewBlock(ch, id, nonce, oldRec.CertID, certID)
+				if err != nil {
+					log.Printf("certd: build renew block for %s: %v", c.CommonName, err)
+					nonce--
+					continue
+				}
+				if err := ch.AddBlock(renewBlk); err != nil {
+					log.Printf("certd: add renew block for %s: %v", c.CommonName, err)
+					nonce--
+					continue
+				}
+				if err := certStore.ApplyBlock(renewBlk); err != nil {
+					log.Printf("certd: cert store apply renew: %v", err)
+				}
+				client.MarkUnpublished(oldRec.AVXCertID)
+				renewedOldAVXIDs[oldRec.AVXCertID] = struct{}{}
+				syncer.PushBlockToPeers(renewBlk)
+				_ = saveChain(ch, configDir)
+			}
 		}
 
 		for _, c := range result.RevokedCerts {
+			// Skip certs superseded by a TxCertRenew this cycle.
+			if _, skip := renewedOldAVXIDs[c.AVXCertID]; skip {
+				continue
+			}
 			certID := certIDFromAVX(certStore, c.AVXCertID)
 			if certID == nil {
 				continue
@@ -202,15 +240,42 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
 		}
+
+		// CM-02: auto-revoke any active cert whose not_after has passed.
+		// This is the local expiry enforcement fallback for when AVX is slow or
+		// silent about an expiry.
+		now := time.Now().Unix()
+		for _, rec := range certStore.List(true) {
+			if rec.NotAfter > now {
+				continue
+			}
+			nonce++
+			blk, err := buildRevokeBlock(ch, id, nonce, rec.CertID)
+			if err != nil {
+				log.Printf("certd: build expiry revoke for %s: %v", rec.CN, err)
+				nonce--
+				continue
+			}
+			if err := ch.AddBlock(blk); err != nil {
+				log.Printf("certd: add expiry revoke for %s: %v", rec.CN, err)
+				nonce--
+				continue
+			}
+			if err := certStore.ApplyBlock(blk); err != nil {
+				log.Printf("certd: cert store expiry revoke for %s: %v", rec.CN, err)
+			}
+			syncer.PushBlockToPeers(blk)
+			_ = saveChain(ch, configDir)
+		}
 	}
 }
 
-func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *avx.Cert, configDir string, client *avx.Client) (chain.Block, error) {
+func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *avx.Cert, configDir string, client *avx.Client) (chain.Block, [32]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	der, err := client.GetDER(ctx, c.AVXCertID)
 	cancel()
 	if err != nil {
-		return chain.Block{}, fmt.Errorf("get DER: %w", err)
+		return chain.Block{}, [32]byte{}, fmt.Errorf("get DER: %w", err)
 	}
 
 	certID := sha256.Sum256(der)
@@ -232,11 +297,40 @@ func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *av
 		Serial:    c.Serial,
 	})
 	if err != nil {
-		return chain.Block{}, err
+		return chain.Block{}, [32]byte{}, err
 	}
 
 	tx := chain.Transaction{
 		Type:       chain.TxCertPublish,
+		NodePubkey: id.PublicKey,
+		Timestamp:  chain.Now(),
+		Nonce:      nonce,
+		Payload:    payload,
+	}
+	chain.Sign(&tx, id)
+
+	tip := ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: chain.Now(),
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+	return blk, certID, nil
+}
+
+func buildRenewBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, oldCertID, newCertID [32]byte) (chain.Block, error) {
+	payload, err := chain.MarshalRenew(&chain.CertRenewPayload{
+		OldCertID: oldCertID,
+		NewCertID: newCertID,
+	})
+	if err != nil {
+		return chain.Block{}, err
+	}
+
+	tx := chain.Transaction{
+		Type:       chain.TxCertRenew,
 		NodePubkey: id.PublicKey,
 		Timestamp:  chain.Now(),
 		Nonce:      nonce,
@@ -287,7 +381,7 @@ func buildRevokeBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, certID
 
 func certIDFromAVX(certStore *cert.Store, avxCertID string) *[32]byte {
 	for _, rec := range certStore.List(false) {
-		if rec.AVXCertID == avxCertID {
+		if rec.AVXCertID == avxCertID && rec.Status != cert.StatusReplaced {
 			id := rec.CertID
 			return &id
 		}
