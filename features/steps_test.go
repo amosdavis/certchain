@@ -5,9 +5,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/amosdavis/certchain/internal/avx"
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
@@ -17,15 +22,17 @@ import (
 // ---- world holds test state for each scenario ----
 
 type world struct {
-	identity    *crypto.Identity
-	ch          *chain.Chain
-	certStore   *cert.Store
-	nonce       uint32
-	lastCertID  [32]byte
-	lastCN      string
-	lastErr     error
-	pendingCert *pendingCertSpec // cert staged but not yet published
-	altCertID   [32]byte         // used for renew tests
+	identity     *crypto.Identity
+	ch           *chain.Chain
+	certStore    *cert.Store
+	nonce        uint32
+	lastCertID   [32]byte
+	lastCN       string
+	lastErr      error
+	pendingCert  *pendingCertSpec // cert staged but not yet published
+	altCertID    [32]byte         // used for renew tests
+	avxServer    *httptest.Server // mock AVX renewal server
+	avxRenewCalls []string        // AVX cert IDs requested for renewal
 }
 
 type pendingCertSpec struct {
@@ -54,6 +61,11 @@ func (w *world) reset() {
 	w.lastErr = nil
 	w.pendingCert = nil
 	w.altCertID = [32]byte{}
+	if w.avxServer != nil {
+		w.avxServer.Close()
+		w.avxServer = nil
+	}
+	w.avxRenewCalls = nil
 }
 
 func (w *world) nextNonce() uint32 {
@@ -618,6 +630,65 @@ func (w *world) theNewCertForHasStatus(cn, expectedStatus string) error {
 	return nil
 }
 
+// aMockAVXRenewalServerIsConfigured starts a lightweight mock AVX server that
+// records POST /avxapi/certificate/{avxCertID}/renew calls.
+func (w *world) aMockAVXRenewalServerIsConfigured() {
+	w.avxRenewCalls = nil
+	w.avxServer = httptest.NewServer(http.HandlerFunc(func(wr http.ResponseWriter, r *http.Request) {
+		// Match POST /avxapi/certificate/{avxCertID}/renew
+		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/renew") {
+			parts := strings.Split(r.URL.Path, "/")
+			// path: /avxapi/certificate/{id}/renew — id is parts[3]
+			if len(parts) >= 4 {
+				w.avxRenewCalls = append(w.avxRenewCalls, parts[3])
+			}
+			wr.WriteHeader(http.StatusAccepted)
+			return
+		}
+		http.NotFound(wr, r)
+	}))
+}
+
+// theProactiveRenewalCheckRunsWithWindowSecondsAtWallTime simulates the proactive
+// renewal scan from avxPollLoop: for each active cert with not_after within the
+// renewal window, call the AVX renewal API.
+func (w *world) theProactiveRenewalCheckRunsWithWindowSecondsAtWallTime(windowSecs, wallTime int64) {
+	if w.avxServer == nil {
+		w.lastErr = errors.New("mock AVX server not configured")
+		return
+	}
+	avxClient := avx.NewClient(avx.Config{BaseURL: w.avxServer.URL, APIKey: "test-key"})
+	renewCutoff := wallTime + windowSecs
+	for _, rec := range w.certStore.List(true) {
+		if rec.NotAfter <= wallTime || rec.NotAfter > renewCutoff {
+			continue // already expired or outside window
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = avxClient.RenewCert(ctx, rec.AVXCertID)
+		cancel()
+	}
+}
+
+// theAVXRenewalAPIWasCalledFor checks that the mock server received a renewal call
+// for the cert matching the given CN. AVX cert IDs follow the pattern "AVX-{cn}".
+func (w *world) theAVXRenewalAPIWasCalledFor(cn string) error {
+	expected := "AVX-" + cn
+	for _, id := range w.avxRenewCalls {
+		if id == expected {
+			return nil
+		}
+	}
+	return fmt.Errorf("AVX renewal API was not called for %q (calls: %v)", expected, w.avxRenewCalls)
+}
+
+// theAVXRenewalAPIWasNotCalled checks that the mock server received no renewal calls.
+func (w *world) theAVXRenewalAPIWasNotCalled() error {
+	if len(w.avxRenewCalls) > 0 {
+		return fmt.Errorf("expected no AVX renewal calls, got: %v", w.avxRenewCalls)
+	}
+	return nil
+}
+
 // ---- godog wiring ----
 
 func InitializeScenario(ctx *godog.ScenarioContext) {
@@ -666,6 +737,11 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the expiry monitor runs at wall time (\d+)$`, w.theExpiryMonitorRunsAtWallTime)
 	ctx.Step(`^AVX reports a renewal for CN "([^"]+)" valid from (\d+) to (\d+) at block time (\d+)$`, w.avxReportsARenewalForCNValidFromToAtBlockTime)
 	ctx.Step(`^the new cert for "([^"]+)" has status "([^"]+)"$`, w.theNewCertForHasStatus)
+	// Proactive renewal.
+	ctx.Step(`^a mock AVX renewal server is configured$`, w.aMockAVXRenewalServerIsConfigured)
+	ctx.Step(`^the proactive renewal check runs with window (\d+) seconds at wall time (\d+)$`, w.theProactiveRenewalCheckRunsWithWindowSecondsAtWallTime)
+	ctx.Step(`^the AVX renewal API was called for "([^"]+)"$`, w.theAVXRenewalAPIWasCalledFor)
+	ctx.Step(`^the AVX renewal API was not called$`, w.theAVXRenewalAPIWasNotCalled)
 }
 
 func TestBDD(t *testing.T) {

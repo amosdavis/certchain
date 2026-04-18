@@ -37,6 +37,7 @@ func main() {
 	avxKey := flag.String("avx-key", "", "AppViewX API key")
 	queryAddr := flag.String("query-addr", ":9879", "HTTP query API listen address")
 	maxCerts := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
+	renewWindow := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
 	flag.Parse()
 
 	id, err := crypto.LoadOrCreate(*configDir)
@@ -113,7 +114,7 @@ func main() {
 		for _, rec := range certStore.List(false) {
 			avxClient.MarkPublished(rec.AVXCertID)
 		}
-		go avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir)
+		go avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow)
 	} else {
 		log.Printf("certd: no --avx-url set; AVX polling disabled")
 	}
@@ -136,7 +137,9 @@ func main() {
 // avxPollLoop polls AppViewX and publishes new/revoked/renewed certs to the chain.
 // It also enforces certificate expiry (CM-02): any active cert whose not_after
 // has passed is auto-revoked via TxCertRevoke.
-func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string) {
+// When renewWindow > 0, it proactively calls the AVX renewal API for certs
+// approaching expiry so that AVX issues a replacement before the cert expires.
+func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration) {
 	var nonce uint32
 	// Resume nonce from chain to avoid replay (monotonic per-node).
 	for _, blk := range ch.GetBlocks() {
@@ -266,6 +269,27 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			}
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
+		}
+
+		// Proactive renewal: trigger AVX to issue a replacement cert for any
+		// active cert within the renewal window. The new cert will appear in
+		// the next poll cycle via result.NewCerts and be linked via TxCertRenew.
+		// Idempotent: AVX returns HTTP 409 if a renewal is already in progress.
+		if renewWindow > 0 {
+			renewWindowSecs := int64(renewWindow.Seconds())
+			renewCutoff := now + renewWindowSecs
+			for _, rec := range certStore.List(true) {
+				if rec.NotAfter <= now || rec.NotAfter > renewCutoff {
+					continue // already expired or not yet within window
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if err := client.RenewCert(ctx, rec.AVXCertID); err != nil {
+					log.Printf("certd: proactive renewal trigger for %s: %v", rec.CN, err)
+				} else {
+					log.Printf("certd: triggered AVX renewal for %s (expires in %ds)", rec.CN, rec.NotAfter-now)
+				}
+				cancel()
+			}
 		}
 	}
 }

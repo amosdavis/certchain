@@ -2,6 +2,7 @@ Feature: Certificate Auto-Renewal
   As a certchain node
   I want expired certificates to be automatically revoked
   And AVX-driven renewals to be linked on-chain via TxCertRenew
+  And certs approaching expiry to trigger a proactive AVX renewal request
   So that the blockchain accurately reflects the current certificate lifecycle
 
   Background:
@@ -29,3 +30,17 @@ Feature: Certificate Auto-Renewal
     When the expiry monitor runs at wall time 3000
     Then the cert store contains "done.example.com" with status "revoked"
     And the chain height is 3
+
+  Scenario: Cert within renewal window triggers AVX renewal API call
+    Given a mock AVX renewal server is configured
+    And a certificate with CN "soon.example.com" valid from 1000 to 2000
+    And the certificate is published at block time 1500
+    When the proactive renewal check runs with window 1500 seconds at wall time 600
+    Then the AVX renewal API was called for "soon.example.com"
+
+  Scenario: Cert outside renewal window does not trigger AVX renewal
+    Given a mock AVX renewal server is configured
+    And a certificate with CN "distant.example.com" valid from 1000 to 9999
+    And the certificate is published at block time 1500
+    When the proactive renewal check runs with window 1500 seconds at wall time 600
+    Then the AVX renewal API was not called

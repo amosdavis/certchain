@@ -157,6 +157,35 @@ func (c *Client) PollIntervalWithJitter() time.Duration {
 	return base + jitter
 }
 
+// RenewCert requests AppViewX to renew the certificate with the given AVX cert ID.
+// The renewed certificate will appear in the next Poll cycle as a new cert.
+func (c *Client) RenewCert(ctx context.Context, avxCertID string) error {
+	url := fmt.Sprintf("%s/avxapi/certificate/%s/renew", c.cfg.BaseURL, avxCertID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	c.setAuthHeader(req)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("AVX renew request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		return nil
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("AVX renew auth error: HTTP %d", resp.StatusCode)
+	case http.StatusConflict:
+		return fmt.Errorf("AVX renew conflict: renewal already in progress for %s", avxCertID)
+	default:
+		return fmt.Errorf("AVX renew unexpected status: %d", resp.StatusCode)
+	}
+}
+
 // ---- private helpers ----
 
 type avxListResponse struct {

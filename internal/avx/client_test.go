@@ -138,3 +138,63 @@ func TestPollIntervalWithJitter(t *testing.T) {
 		}
 	}
 }
+
+func TestRenewCertSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "want POST", http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	client := avx.NewClient(avx.Config{BaseURL: srv.URL, APIKey: "key"})
+	if err := client.RenewCert(context.Background(), "AVX-999"); err != nil {
+		t.Fatalf("RenewCert: %v", err)
+	}
+}
+
+func TestRenewCertAuthError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	client := avx.NewClient(avx.Config{BaseURL: srv.URL, APIKey: "bad-key"})
+	err := client.RenewCert(context.Background(), "AVX-999")
+	if err == nil {
+		t.Fatal("expected error for 401, got nil")
+	}
+}
+
+func TestRenewCertConflict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer srv.Close()
+
+	client := avx.NewClient(avx.Config{BaseURL: srv.URL, APIKey: "key"})
+	err := client.RenewCert(context.Background(), "AVX-999")
+	if err == nil {
+		t.Fatal("expected error for 409, got nil")
+	}
+}
+
+func TestRenewCertCallsCorrectPath(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	client := avx.NewClient(avx.Config{BaseURL: srv.URL, APIKey: "key"})
+	if err := client.RenewCert(context.Background(), "AVX-abc-123"); err != nil {
+		t.Fatalf("RenewCert: %v", err)
+	}
+	want := "/avxapi/certificate/AVX-abc-123/renew"
+	if gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+}
