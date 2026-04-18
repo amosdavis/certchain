@@ -1,0 +1,346 @@
+// certd is the certchain daemon.
+//
+// It manages a certchain blockchain node: polls AppViewX for new or revoked
+// certificates, maintains the local chain and cert store, syncs with peers,
+// and exposes the HTTP query API on :9879.
+//
+// Usage:
+//
+//	certd [--config <dir>] [--avx-url <url>] [--avx-key <key>]
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/amosdavis/certchain/internal/avx"
+	"github.com/amosdavis/certchain/internal/cert"
+	"github.com/amosdavis/certchain/internal/chain"
+	"github.com/amosdavis/certchain/internal/crypto"
+	"github.com/amosdavis/certchain/internal/peer"
+	"github.com/amosdavis/certchain/internal/query"
+)
+
+func main() {
+	configDir := flag.String("config", defaultConfigDir(), "config directory")
+	avxURL := flag.String("avx-url", "", "AppViewX base URL (e.g. https://avx.example.com)")
+	avxKey := flag.String("avx-key", "", "AppViewX API key")
+	queryAddr := flag.String("query-addr", ":9879", "HTTP query API listen address")
+	maxCerts := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
+	flag.Parse()
+
+	id, err := crypto.LoadOrCreate(*configDir)
+	if err != nil {
+		log.Fatalf("certd: load identity: %v", err)
+	}
+	log.Printf("certd: node pubkey %s", id.PubKeyHex())
+
+	ch := chain.New()
+	certStore := cert.NewStore(*maxCerts)
+	peerTable := peer.NewTable()
+
+	// Load persisted chain if present.
+	if err := loadChain(ch, certStore, *configDir); err != nil {
+		log.Printf("certd: load chain: %v (starting fresh)", err)
+	}
+
+	// Peer discovery.
+	discoverer := peer.NewDiscoverer(peerTable, id.PublicKey, peer.SyncPort)
+	if err := discoverer.Start(); err != nil {
+		log.Fatalf("certd: start discovery: %v", err)
+	}
+	defer discoverer.Stop()
+
+	// Block sync.
+	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey)
+	syncer.OnNewBlocks = func(candidate []chain.Block) {
+		replaced, err := ch.Replace(candidate)
+		if err != nil {
+			log.Printf("certd: chain replace error: %v", err)
+			return
+		}
+		if replaced {
+			log.Printf("certd: chain replaced with candidate len=%d", len(candidate))
+			if err := certStore.RebuildFrom(ch.GetBlocks()); err != nil {
+				log.Printf("certd: cert store rebuild: %v", err)
+			}
+			if err := saveChain(ch, *configDir); err != nil {
+				log.Printf("certd: save chain: %v", err)
+			}
+		}
+	}
+	if err := syncer.Start(); err != nil {
+		log.Fatalf("certd: start syncer: %v", err)
+	}
+	defer syncer.Stop()
+
+	// Initial peer sync.
+	syncer.SyncFromPeers()
+
+	// HTTP query API.
+	qserver := query.NewServer(certStore, ch, peerTable, *configDir)
+	httpServer := &http.Server{
+		Addr:         *queryAddr,
+		Handler:      qserver.Handler(),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	go func() {
+		log.Printf("certd: query API on %s", *queryAddr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("certd: HTTP server error: %v", err)
+		}
+	}()
+
+	// AppViewX polling loop.
+	if *avxURL != "" {
+		avxClient := avx.NewClient(avx.Config{
+			BaseURL: *avxURL,
+			APIKey:  *avxKey,
+		})
+		// Pre-populate published set from existing cert store.
+		for _, rec := range certStore.List(false) {
+			avxClient.MarkPublished(rec.AVXCertID)
+		}
+		go avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir)
+	} else {
+		log.Printf("certd: no --avx-url set; AVX polling disabled")
+	}
+
+	// Wait for shutdown signal.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("certd: shutting down")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(ctx)
+
+	if err := saveChain(ch, *configDir); err != nil {
+		log.Printf("certd: save chain on shutdown: %v", err)
+	}
+}
+
+// avxPollLoop polls AppViewX and publishes new/revoked certs to the chain.
+func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string) {
+	var nonce uint32
+	// Resume nonce from chain to avoid replay (monotonic per-node).
+	for _, blk := range ch.GetBlocks() {
+		for _, tx := range blk.Txs {
+			if tx.NodePubkey == id.PublicKey && tx.Nonce > nonce {
+				nonce = tx.Nonce
+			}
+		}
+	}
+
+	for {
+		d := client.PollIntervalWithJitter()
+		time.Sleep(d)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		result, err := client.Poll(ctx)
+		cancel()
+
+		if err != nil {
+			log.Printf("certd: AVX poll error: %v", err)
+			continue
+		}
+
+		for _, c := range result.NewCerts {
+			nonce++
+			blk, err := buildPublishBlock(ch, id, nonce, c, configDir, client)
+			if err != nil {
+				log.Printf("certd: build publish block for %s: %v", c.CommonName, err)
+				nonce-- // roll back nonce on error
+				continue
+			}
+			if err := ch.AddBlock(blk); err != nil {
+				log.Printf("certd: add publish block for %s: %v", c.CommonName, err)
+				nonce--
+				continue
+			}
+			if err := certStore.ApplyBlock(blk); err != nil {
+				log.Printf("certd: cert store apply publish: %v", err)
+			}
+			client.MarkPublished(c.AVXCertID)
+			syncer.PushBlockToPeers(blk)
+			_ = saveChain(ch, configDir)
+		}
+
+		for _, c := range result.RevokedCerts {
+			certID := certIDFromAVX(certStore, c.AVXCertID)
+			if certID == nil {
+				continue
+			}
+			nonce++
+			blk, err := buildRevokeBlock(ch, id, nonce, *certID)
+			if err != nil {
+				log.Printf("certd: build revoke block: %v", err)
+				nonce--
+				continue
+			}
+			if err := ch.AddBlock(blk); err != nil {
+				log.Printf("certd: add revoke block: %v", err)
+				nonce--
+				continue
+			}
+			if err := certStore.ApplyBlock(blk); err != nil {
+				log.Printf("certd: cert store apply revoke: %v", err)
+			}
+			syncer.PushBlockToPeers(blk)
+			_ = saveChain(ch, configDir)
+		}
+	}
+}
+
+func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *avx.Cert, configDir string, client *avx.Client) (chain.Block, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	der, err := client.GetDER(ctx, c.AVXCertID)
+	cancel()
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("get DER: %w", err)
+	}
+
+	certID := sha256.Sum256(der)
+
+	// Cache DER locally.
+	derDir := filepath.Join(configDir, "certs")
+	if err := os.MkdirAll(derDir, 0700); err == nil {
+		hexID := fmt.Sprintf("%x", certID)
+		_ = os.WriteFile(filepath.Join(derDir, hexID+".der"), der, 0600)
+	}
+
+	payload, err := chain.MarshalPublish(&chain.CertPublishPayload{
+		CertID:    certID,
+		CN:        c.CommonName,
+		AVXCertID: c.AVXCertID,
+		NotBefore: c.NotBefore.Unix(),
+		NotAfter:  c.NotAfter.Unix(),
+		SANs:      c.SANs,
+		Serial:    c.Serial,
+	})
+	if err != nil {
+		return chain.Block{}, err
+	}
+
+	tx := chain.Transaction{
+		Type:       chain.TxCertPublish,
+		NodePubkey: id.PublicKey,
+		Timestamp:  chain.Now(),
+		Nonce:      nonce,
+		Payload:    payload,
+	}
+	chain.Sign(&tx, id)
+
+	tip := ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: chain.Now(),
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+	return blk, nil
+}
+
+func buildRevokeBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, certID [32]byte) (chain.Block, error) {
+	payload, err := chain.MarshalRevoke(&chain.CertRevokePayload{
+		CertID:    certID,
+		Reason:    0, // unspecified
+		RevokedAt: chain.Now(),
+	})
+	if err != nil {
+		return chain.Block{}, err
+	}
+
+	tx := chain.Transaction{
+		Type:       chain.TxCertRevoke,
+		NodePubkey: id.PublicKey,
+		Timestamp:  chain.Now(),
+		Nonce:      nonce,
+		Payload:    payload,
+	}
+	chain.Sign(&tx, id)
+
+	tip := ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: chain.Now(),
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+	return blk, nil
+}
+
+func certIDFromAVX(certStore *cert.Store, avxCertID string) *[32]byte {
+	for _, rec := range certStore.List(false) {
+		if rec.AVXCertID == avxCertID {
+			id := rec.CertID
+			return &id
+		}
+	}
+	return nil
+}
+
+// ---- persistence ----
+
+type persistedChain struct {
+	Blocks []chain.Block `json:"blocks"`
+}
+
+func saveChain(ch *chain.Chain, configDir string) error {
+	data, err := json.Marshal(persistedChain{Blocks: ch.GetBlocks()})
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(configDir, "chain.json")
+	return os.WriteFile(path, data, 0600)
+}
+
+func loadChain(ch *chain.Chain, certStore *cert.Store, configDir string) error {
+	path := filepath.Join(configDir, "chain.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var p persistedChain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	if len(p.Blocks) == 0 {
+		return nil
+	}
+
+	replaced, err := ch.Replace(p.Blocks)
+	if err != nil {
+		return fmt.Errorf("restore chain: %w", err)
+	}
+	if replaced {
+		return certStore.RebuildFrom(ch.GetBlocks())
+	}
+	return nil
+}
+
+func defaultConfigDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".certchain"
+	}
+	return filepath.Join(home, ".certchain")
+}
