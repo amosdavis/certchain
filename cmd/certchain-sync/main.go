@@ -127,7 +127,9 @@ func (c *Controller) ReconcileAll(ctx context.Context) error {
 	return nil
 }
 
-// syncCert fetches the DER for a cert and upserts a kubernetes.io/tls Secret.
+// syncCert fetches the DER (and key if available) for a cert and upserts a
+// kubernetes.io/tls Secret. tls.key is populated when certchain generated the
+// key pair via --csr-domains; otherwise it is left empty.
 func (c *Controller) syncCert(ctx context.Context, certIDHex, cn string, notAfter int64) error {
 	der, err := c.fetchDER(ctx, certIDHex)
 	if err != nil {
@@ -135,6 +137,9 @@ func (c *Controller) syncCert(ctx context.Context, certIDHex, cn string, notAfte
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+
+	// Attempt to fetch the private key; not an error if absent (externally issued cert).
+	keyPEM, _ := c.fetchKey(ctx, certIDHex)
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -152,8 +157,7 @@ func (c *Controller) syncCert(ctx context.Context, certIDHex, cn string, notAfte
 		Type: corev1.SecretTypeTLS,
 		Data: map[string][]byte{
 			corev1.TLSCertKey:       certPEM,
-			// certchain does not store private keys; supply tls.key separately.
-			corev1.TLSPrivateKeyKey: {},
+			corev1.TLSPrivateKeyKey: keyPEM, // empty if key not managed by certchain
 		},
 	}
 
@@ -225,7 +229,21 @@ func (c *Controller) upsertSecret(ctx context.Context, s *corev1.Secret) error {
 
 // fetchDER downloads the DER bytes for the given cert_id hex from the certd query API.
 func (c *Controller) fetchDER(ctx context.Context, certIDHex string) ([]byte, error) {
-	url := fmt.Sprintf("%s/cert/%s/der", c.certdURL, certIDHex)
+	return c.fetchCertFile(ctx, certIDHex, "der")
+}
+
+// fetchKey downloads the PEM private key for the given cert_id hex, if certchain
+// generated it via --csr-domains. Returns nil without error when the key is absent.
+func (c *Controller) fetchKey(ctx context.Context, certIDHex string) ([]byte, error) {
+	data, err := c.fetchCertFile(ctx, certIDHex, "key")
+	if err != nil {
+		return nil, nil // key not available for this cert; not an error
+	}
+	return data, nil
+}
+
+func (c *Controller) fetchCertFile(ctx context.Context, certIDHex, ext string) ([]byte, error) {
+	url := fmt.Sprintf("%s/cert/%s/%s", c.certdURL, certIDHex, ext)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

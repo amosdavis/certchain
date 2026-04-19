@@ -150,7 +150,7 @@ func (s *Syncer) FetchDERFromPeers(certIDHex string) ([]byte, error) {
 }
 
 func (s *Syncer) fetchDERFromPeer(p *Peer, certIDHex string) ([]byte, error) {
-	addr := fmt.Sprintf("%s:%d", p.Addr.IP, p.SyncPort)
+	addr := net.JoinHostPort(p.Addr.IP.String(), fmt.Sprint(p.SyncPort))
 	conn, err := net.DialTimeout("tcp", addr, syncTimeout)
 	if err != nil {
 		return nil, err
@@ -304,7 +304,7 @@ func (s *Syncer) handleCertReq(conn net.Conn, data []byte) {
 }
 
 func (s *Syncer) pushBlock(p *Peer, b chain.Block) {
-	addr := fmt.Sprintf("%s:%d", p.Addr.IP, p.SyncPort)
+	addr := net.JoinHostPort(p.Addr.IP.String(), fmt.Sprint(p.SyncPort))
 	conn, err := net.DialTimeout("tcp", addr, syncTimeout)
 	if err != nil {
 		return
@@ -315,7 +315,7 @@ func (s *Syncer) pushBlock(p *Peer, b chain.Block) {
 }
 
 func (s *Syncer) syncFromPeer(p *Peer) {
-	addr := fmt.Sprintf("%s:%d", p.Addr.IP, p.SyncPort)
+	addr := net.JoinHostPort(p.Addr.IP.String(), fmt.Sprint(p.SyncPort))
 	conn, err := net.DialTimeout("tcp", addr, syncTimeout)
 	if err != nil {
 		return

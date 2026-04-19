@@ -53,7 +53,7 @@ func NewServer(store *cert.Store, chain ChainInfo, peers *peer.Table, configDir 
 	}
 	s.mux.HandleFunc("/status", s.handleStatus)
 	s.mux.HandleFunc("/cert/list", s.handleCertList)
-	s.mux.HandleFunc("/cert/", s.handleCertByPath) // /cert/<hex>/der
+	s.mux.HandleFunc("/cert/", s.handleCertByPath) // /cert/<hex>/der and /cert/<hex>/key
 	s.mux.HandleFunc("/cert", s.handleCert)        // ?cn= or ?id=
 	return s
 }
@@ -170,67 +170,72 @@ func (s *Server) handleCertList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleCertByPath handles /cert/<hex>/der.
+// handleCertByPath handles /cert/<hex>/der and /cert/<hex>/key.
 func (s *Server) handleCertByPath(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Path: /cert/<hex>/der
 	path := r.URL.Path
 	const prefix = "/cert/"
 	if len(path) < len(prefix) {
 		http.Error(w, "bad path", http.StatusBadRequest)
 		return
 	}
-	rest := path[len(prefix):] // e.g. "abc123.../der"
+	rest := path[len(prefix):]
 
-	const suffix = "/der"
-	if len(rest) < len(suffix) || rest[len(rest)-len(suffix):] != suffix {
-		http.Error(w, "path must be /cert/<hex>/der", http.StatusBadRequest)
-		return
+	switch {
+	case len(rest) > 4 && rest[len(rest)-4:] == "/der":
+		s.serveCertFile(w, rest[:len(rest)-4], "der",
+			"application/pkix-cert", "DER not cached on this node")
+	case len(rest) > 4 && rest[len(rest)-4:] == "/key":
+		// NOTE: restrict access to this endpoint with a NetworkPolicy in production;
+		// it serves private key material.
+		s.serveCertFile(w, rest[:len(rest)-4], "key",
+			"application/x-pem-file", "key not available for this cert")
+	default:
+		http.Error(w, "path must be /cert/<hex>/der or /cert/<hex>/key", http.StatusBadRequest)
 	}
-	hexID := rest[:len(rest)-len(suffix)]
+}
 
+func (s *Server) serveCertFile(w http.ResponseWriter, hexID, ext, contentType, notFoundMsg string) {
 	certID, err := hexTo32(hexID)
 	if err != nil {
 		http.Error(w, "invalid cert_id hex", http.StatusBadRequest)
 		return
 	}
-
-	// Verify the cert exists on chain.
 	if _, ok := s.store.GetByID(certID); !ok {
 		http.Error(w, "cert not found", http.StatusNotFound)
 		return
 	}
 
-	// Serve DER from local cache (CM-12: return metadata-only if DER absent).
-	derPath := filepath.Join(s.configDir, "certs", fmt.Sprintf("%s.der", hexID))
-	data, err := os.ReadFile(derPath)
+	filePath := filepath.Join(s.configDir, ext+"s", fmt.Sprintf("%s.%s", hexID, ext))
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if s.derFetcher != nil {
+			// For DER, attempt peer fetch and cache locally.
+			if ext == "der" && s.derFetcher != nil {
 				fetched, fetchErr := s.derFetcher.FetchDERFromPeers(hexID)
 				if fetchErr == nil {
-					if mkErr := os.MkdirAll(filepath.Dir(derPath), 0700); mkErr == nil {
-						_ = os.WriteFile(derPath, fetched, 0600)
+					if mkErr := os.MkdirAll(filepath.Dir(filePath), 0700); mkErr == nil {
+						_ = os.WriteFile(filePath, fetched, 0600)
 					}
-					w.Header().Set("Content-Type", "application/pkix-cert")
+					w.Header().Set("Content-Type", contentType)
 					w.Header().Set("Content-Length", strconv.Itoa(len(fetched)))
 					w.WriteHeader(http.StatusOK)
 					_, _ = w.Write(fetched)
 					return
 				}
 			}
-			http.Error(w, "DER not cached on this node", http.StatusNotFound)
+			http.Error(w, notFoundMsg, http.StatusNotFound)
 			return
 		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/pkix-cert")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)

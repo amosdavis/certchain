@@ -2,6 +2,7 @@
 package avx
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -198,6 +199,63 @@ func (c *Client) RenewCert(ctx context.Context, avxCertID string) error {
 	default:
 		return fmt.Errorf("AVX renew unexpected status: %d", resp.StatusCode)
 	}
+}
+
+// csrRequest is the payload sent to AppViewX to request certificate issuance via CSR.
+type csrRequest struct {
+	CommonName      string   `json:"commonName"`
+	SubjectAltNames []string `json:"subjectAltNames,omitempty"`
+	CSR             string   `json:"csr"` // PEM-encoded
+	ValidityDays    int      `json:"validityDays"`
+}
+
+// SubmitCSR submits a PEM-encoded CSR to AppViewX and returns the AVX request ID.
+// validityDays of 0 defaults to 365.
+func (c *Client) SubmitCSR(ctx context.Context, cn string, sans []string, csrPEM []byte, validityDays int) (string, error) {
+	if validityDays == 0 {
+		validityDays = 365
+	}
+	body, err := json.Marshal(csrRequest{
+		CommonName:      cn,
+		SubjectAltNames: sans,
+		CSR:             string(csrPEM),
+		ValidityDays:    validityDays,
+	})
+	if err != nil {
+		return "", err
+	}
+	url := fmt.Sprintf("%s/avxapi/certificate/request", c.cfg.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	c.setAuthHeader(req)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("AVX CSR submit: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
+	case http.StatusConflict:
+		return "", fmt.Errorf("AVX CSR already pending for %s", cn)
+	default:
+		return "", fmt.Errorf("AVX CSR submit: HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		RequestID string `json:"requestId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("AVX CSR response decode: %w", err)
+	}
+	if result.RequestID == "" {
+		return "", fmt.Errorf("AVX CSR response: empty requestId")
+	}
+	return result.RequestID, nil
 }
 
 // ---- private helpers ----

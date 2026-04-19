@@ -30,6 +30,7 @@ import (
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
+	"github.com/amosdavis/certchain/internal/csr"
 	"github.com/amosdavis/certchain/internal/peer"
 	"github.com/amosdavis/certchain/internal/query"
 )
@@ -43,6 +44,7 @@ func main() {
 	renewWindow := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
 	notifyURL   := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
 	staticPeers := flag.String("static-peers", "", "comma-separated host:port peers for cross-cluster sync")
+	csrDomains  := flag.String("csr-domains", "", "path to JSON file listing CNs/SANs to auto-request from AVX")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -136,7 +138,7 @@ func main() {
 			for _, rec := range certStore.List(false) {
 				avxClient.MarkPublished(rec.AVXCertID)
 			}
-			avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow, *notifyURL)
+			avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow, *notifyURL, *csrDomains)
 		}()
 	} else {
 		log.Printf("certd: no --avx-url set; AVX polling disabled")
@@ -162,7 +164,7 @@ func main() {
 // has passed is auto-revoked via TxCertRevoke.
 // When renewWindow > 0, it proactively calls the AVX renewal API for certs
 // approaching expiry so that AVX issues a replacement before the cert expires.
-func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration, notifyURL string) {
+func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration, notifyURL string, csrDomainsFile string) {
 	var nonce uint32
 	// Resume nonce from chain to avoid replay (monotonic per-node).
 	for _, blk := range ch.GetBlocks() {
@@ -171,6 +173,13 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 				nonce = tx.Nonce
 			}
 		}
+	}
+
+	// CSR store tracks submitted CSRs and associates private keys with issued certs.
+	csrStore, err := csr.NewStore(configDir)
+	if err != nil {
+		log.Printf("certd: csr store init: %v (CSR generation disabled)", err)
+		csrStore = nil
 	}
 
 	const (
@@ -236,6 +245,15 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			client.MarkPublished(c.AVXCertID)
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
+
+			// If a CSR was submitted for this CN, link the private key to cert_id.
+			if csrStore != nil {
+				certIDHex := fmt.Sprintf("%x", certID)
+				keyDir := filepath.Join(configDir, "keys")
+				if _, linkErr := csrStore.LinkCert(c.CommonName, certIDHex, keyDir); linkErr != nil {
+					log.Printf("certd: link CSR key for %s: %v", c.CommonName, linkErr)
+				}
+			}
 
 			// If this is a renewal, emit TxCertRenew linking old → new cert_id.
 			// TxCertRenew sets the old cert's status to "replaced", so no separate
@@ -354,6 +372,55 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 				cancel()
 			}
 		}
+
+		// CSR domain requests: for any domain listed in --csr-domains that has no
+		// active cert and no pending CSR, generate a key pair and submit to AVX.
+		if csrStore != nil && csrDomainsFile != "" {
+			submitPendingCSRs(client, certStore, csrStore, csrDomainsFile)
+		}
+	}
+}
+
+// submitPendingCSRs reads the csr-domains file and submits a CSR to AVX for any
+// domain that has neither an active cert on chain nor a pending CSR already.
+func submitPendingCSRs(client *avx.Client, certStore *cert.Store, csrStore *csr.Store, domainsFile string) {
+	data, err := os.ReadFile(domainsFile)
+	if err != nil {
+		log.Printf("certd: read csr-domains: %v", err)
+		return
+	}
+	var domains []struct {
+		CN   string   `json:"cn"`
+		SANs []string `json:"sans"`
+	}
+	if err := json.Unmarshal(data, &domains); err != nil {
+		log.Printf("certd: parse csr-domains: %v", err)
+		return
+	}
+	for _, d := range domains {
+		if _, ok := certStore.GetByCN(d.CN); ok {
+			continue // already have an active cert
+		}
+		if csrStore.HasPending(d.CN) {
+			continue // CSR already submitted, waiting for issuance
+		}
+		keyPEM, csrPEM, err := csr.Generate(d.CN, d.SANs)
+		if err != nil {
+			log.Printf("certd: generate CSR for %s: %v", d.CN, err)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		requestID, err := client.SubmitCSR(ctx, d.CN, d.SANs, csrPEM, 0)
+		cancel()
+		if err != nil {
+			log.Printf("certd: submit CSR for %s: %v", d.CN, err)
+			continue
+		}
+		if err := csrStore.Add(d.CN, d.SANs, requestID, keyPEM); err != nil {
+			log.Printf("certd: store CSR for %s: %v", d.CN, err)
+			continue
+		}
+		log.Printf("certd: submitted CSR for %s (avx_request_id=%s)", d.CN, requestID)
 	}
 }
 
