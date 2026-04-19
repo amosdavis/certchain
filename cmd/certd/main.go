@@ -10,9 +10,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -38,6 +40,7 @@ func main() {
 	queryAddr := flag.String("query-addr", ":9879", "HTTP query API listen address")
 	maxCerts := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
 	renewWindow := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
+	notifyURL := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
 	flag.Parse()
 
 	id, err := crypto.LoadOrCreate(*configDir)
@@ -63,7 +66,7 @@ func main() {
 	defer discoverer.Stop()
 
 	// Block sync.
-	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey)
+	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey, *configDir)
 	syncer.OnNewBlocks = func(candidate []chain.Block) {
 		replaced, err := ch.Replace(candidate)
 		if err != nil {
@@ -85,11 +88,9 @@ func main() {
 	}
 	defer syncer.Stop()
 
-	// Initial peer sync.
-	syncer.SyncFromPeers()
-
 	// HTTP query API.
 	qserver := query.NewServer(certStore, ch, peerTable, *configDir)
+	qserver.SetDERFetcher(syncer)
 	httpServer := &http.Server{
 		Addr:         *queryAddr,
 		Handler:      qserver.Handler(),
@@ -110,11 +111,18 @@ func main() {
 			BaseURL: *avxURL,
 			APIKey:  *avxKey,
 		})
-		// Pre-populate published set from existing cert store.
-		for _, rec := range certStore.List(false) {
-			avxClient.MarkPublished(rec.AVXCertID)
-		}
-		go avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow)
+		go func() {
+			// Give UDP discovery time to find peers, then sync before polling AVX.
+			// This prevents re-publishing certs already on chain after a restart.
+			time.Sleep(2 * time.Second)
+			syncer.SyncFromPeersAndWait(10 * time.Second)
+
+			// Pre-populate published set from the now-current cert store.
+			for _, rec := range certStore.List(false) {
+				avxClient.MarkPublished(rec.AVXCertID)
+			}
+			avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow, *notifyURL)
+		}()
 	} else {
 		log.Printf("certd: no --avx-url set; AVX polling disabled")
 	}
@@ -139,7 +147,7 @@ func main() {
 // has passed is auto-revoked via TxCertRevoke.
 // When renewWindow > 0, it proactively calls the AVX renewal API for certs
 // approaching expiry so that AVX issues a replacement before the cert expires.
-func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration) {
+func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration, notifyURL string) {
 	var nonce uint32
 	// Resume nonce from chain to avoid replay (monotonic per-node).
 	for _, blk := range ch.GetBlocks() {
@@ -150,18 +158,42 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 		}
 	}
 
+	const (
+		backoffBase = 5 * time.Second
+		backoffMax  = 10 * time.Minute
+	)
+	consecutiveErrors := 0
+	nextSleep := time.Duration(0) // no initial sleep; poll immediately on first iteration
+
 	for {
-		d := client.PollIntervalWithJitter()
-		time.Sleep(d)
+		if nextSleep > 0 {
+			time.Sleep(nextSleep)
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		result, err := client.Poll(ctx)
 		cancel()
 
 		if err != nil {
-			log.Printf("certd: AVX poll error: %v", err)
+			consecutiveErrors++
+			sleep := backoffBase
+			for i := 1; i < consecutiveErrors; i++ {
+				sleep *= 2
+				if sleep > backoffMax {
+					sleep = backoffMax
+					break
+				}
+			}
+			var rateLimitErr *avx.ErrRateLimited
+			if errors.As(err, &rateLimitErr) && rateLimitErr.RetryAfter > sleep {
+				sleep = rateLimitErr.RetryAfter
+			}
+			log.Printf("certd: AVX poll error (retry in %v): %v", sleep, err)
+			nextSleep = sleep
 			continue
 		}
+		consecutiveErrors = 0
+		nextSleep = client.PollIntervalWithJitter()
 
 		// renewedOldAVXIDs tracks old AVX cert IDs superseded by a TxCertRenew this
 		// cycle so that we do not also emit a separate TxCertRevoke for them.
@@ -213,6 +245,10 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 				renewedOldAVXIDs[oldRec.AVXCertID] = struct{}{}
 				syncer.PushBlockToPeers(renewBlk)
 				_ = saveChain(ch, configDir)
+				if notifyURL != "" {
+					go notifyCertEvent(notifyURL, "renewed", c.CommonName,
+						fmt.Sprintf("%x", oldRec.CertID), fmt.Sprintf("%x", certID))
+				}
 			}
 		}
 
@@ -224,6 +260,10 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			certID := certIDFromAVX(certStore, c.AVXCertID)
 			if certID == nil {
 				continue
+			}
+			var revokeCN string
+			if rec, ok := certStore.GetByID(*certID); ok {
+				revokeCN = rec.CN
 			}
 			nonce++
 			blk, err := buildRevokeBlock(ch, id, nonce, *certID)
@@ -242,6 +282,10 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			}
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
+			if notifyURL != "" {
+				go notifyCertEvent(notifyURL, "revoked", revokeCN,
+					fmt.Sprintf("%x", *certID), "")
+			}
 		}
 
 		// CM-02: auto-revoke any active cert whose not_after has passed.
@@ -269,6 +313,10 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			}
 			syncer.PushBlockToPeers(blk)
 			_ = saveChain(ch, configDir)
+			if notifyURL != "" {
+				go notifyCertEvent(notifyURL, "revoked", rec.CN,
+					fmt.Sprintf("%x", rec.CertID), "")
+			}
 		}
 
 		// Proactive renewal: trigger AVX to issue a replacement cert for any
@@ -453,6 +501,34 @@ func loadChain(ch *chain.Chain, certStore *cert.Store, configDir string) error {
 		return certStore.RebuildFrom(ch.GetBlocks())
 	}
 	return nil
+}
+
+// notifyCertEvent POSTs a JSON event to notifyURL. Called in a goroutine; errors are logged only.
+func notifyCertEvent(notifyURL, event, cn, oldCertID, newCertID string) {
+	payload := map[string]string{
+		"event":       event,
+		"cn":          cn,
+		"old_cert_id": oldCertID,
+		"new_cert_id": newCertID,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, notifyURL, bytes.NewReader(data))
+	if err != nil {
+		log.Printf("certd: notify build request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("certd: notify %s for %s: %v", event, cn, err)
+		return
+	}
+	resp.Body.Close()
 }
 
 func defaultConfigDir() string {

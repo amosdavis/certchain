@@ -29,11 +29,18 @@ const (
 
 // Peer holds information about a discovered certchain peer.
 type Peer struct {
-	Addr     *net.UDPAddr
-	PubKey   [32]byte // node public key
-	SyncPort uint16   // TCP port for block sync
-	LastSeen time.Time
+	Addr        *net.UDPAddr
+	PubKey      [32]byte // node public key
+	SyncPort    uint16   // TCP port for block sync
+	LastSeen    time.Time
+	FailCount   int
+	BannedUntil time.Time
 }
+
+const (
+	peerBanThreshold = 10
+	peerBanDuration  = 1 * time.Hour
+)
 
 // Table is a thread-safe table of known peers.
 type Table struct {
@@ -60,15 +67,37 @@ func (t *Table) Remove(addr string) {
 	delete(t.peers, addr)
 }
 
-// All returns a snapshot of all known peers.
+// All returns a snapshot of all known, non-banned peers.
 func (t *Table) All() []*Peer {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	now := time.Now()
 	out := make([]*Peer, 0, len(t.peers))
 	for _, p := range t.peers {
+		if now.Before(p.BannedUntil) {
+			continue
+		}
 		out = append(out, p)
 	}
 	return out
+}
+
+// RecordFailureByIP increments the failure count for all peers with the given IP
+// and bans them if the threshold is reached.
+func (t *Table) RecordFailureByIP(ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, p := range t.peers {
+		if p.Addr.IP.String() != ip {
+			continue
+		}
+		p.FailCount++
+		if p.FailCount >= peerBanThreshold {
+			p.BannedUntil = time.Now().Add(peerBanDuration)
+			p.FailCount = 0
+			log.Printf("peer: banning %s for %v (too many invalid blocks)", p.Addr.IP, peerBanDuration)
+		}
+	}
 }
 
 // Count returns the number of known peers.

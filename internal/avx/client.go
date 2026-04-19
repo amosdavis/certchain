@@ -8,8 +8,22 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 )
+
+// ErrRateLimited is returned by Poll when AVX responds with HTTP 429.
+// RetryAfter is the parsed Retry-After delay (0 if header absent or unparseable).
+type ErrRateLimited struct {
+	RetryAfter time.Duration
+}
+
+func (e *ErrRateLimited) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("AVX API rate limited; retry after %v", e.RetryAfter)
+	}
+	return "AVX API rate limited"
+}
 
 // Config holds the AppViewX connection configuration.
 type Config struct {
@@ -213,8 +227,13 @@ func (c *Client) listCerts(ctx context.Context) ([]*Cert, error) {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return nil, fmt.Errorf("AVX API auth error: HTTP %d", resp.StatusCode)
 	case http.StatusTooManyRequests:
-		retryAfter := resp.Header.Get("Retry-After")
-		return nil, fmt.Errorf("AVX API rate limited (Retry-After: %s)", retryAfter)
+		var retryAfter time.Duration
+		if s := resp.Header.Get("Retry-After"); s != "" {
+			if secs, err := strconv.Atoi(s); err == nil && secs > 0 {
+				retryAfter = time.Duration(secs) * time.Second
+			}
+		}
+		return nil, &ErrRateLimited{RetryAfter: retryAfter}
 	default:
 		return nil, fmt.Errorf("AVX API unexpected status: %d", resp.StatusCode)
 	}

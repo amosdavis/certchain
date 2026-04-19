@@ -27,13 +27,19 @@ type ChainInfo interface {
 	Len() int
 }
 
+// DERFetcher can retrieve DER bytes for a cert from peers when not cached locally.
+type DERFetcher interface {
+	FetchDERFromPeers(certIDHex string) ([]byte, error)
+}
+
 // Server is the HTTP query API server.
 type Server struct {
-	store     *cert.Store
-	chain     ChainInfo
-	peers     *peer.Table
-	configDir string // directory that holds certs/<hex>.der files
-	mux       *http.ServeMux
+	store      *cert.Store
+	chain      ChainInfo
+	peers      *peer.Table
+	configDir  string // directory that holds certs/<hex>.der files
+	derFetcher DERFetcher
+	mux        *http.ServeMux
 }
 
 // NewServer creates a Server wired to the provided dependencies.
@@ -54,6 +60,9 @@ func NewServer(store *cert.Store, chain ChainInfo, peers *peer.Table, configDir 
 
 // Handler returns the http.Handler for use with http.ListenAndServe.
 func (s *Server) Handler() http.Handler { return s.mux }
+
+// SetDERFetcher wires in a peer DER fetcher used as fallback when the local cache is missing.
+func (s *Server) SetDERFetcher(f DERFetcher) { s.derFetcher = f }
 
 // ---- response types ----
 
@@ -201,6 +210,19 @@ func (s *Server) handleCertByPath(w http.ResponseWriter, r *http.Request) {
 	data, err := os.ReadFile(derPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if s.derFetcher != nil {
+				fetched, fetchErr := s.derFetcher.FetchDERFromPeers(hexID)
+				if fetchErr == nil {
+					if mkErr := os.MkdirAll(filepath.Dir(derPath), 0700); mkErr == nil {
+						_ = os.WriteFile(derPath, fetched, 0600)
+					}
+					w.Header().Set("Content-Type", "application/pkix-cert")
+					w.Header().Set("Content-Length", strconv.Itoa(len(fetched)))
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(fetched)
+					return
+				}
+			}
 			http.Error(w, "DER not cached on this node", http.StatusNotFound)
 			return
 		}
