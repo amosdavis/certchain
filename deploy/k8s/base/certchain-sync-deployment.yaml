@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: certchain-sync
+  namespace: certchain
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: certchain-sync
+  template:
+    metadata:
+      labels:
+        app: certchain-sync
+    spec:
+      serviceAccountName: certchain-sync
+      containers:
+      - name: certchain-sync
+        image: your-registry/certchain:latest
+        command: ["/usr/local/bin/certchain-sync"]
+        args:
+        - --certd-url=http://certchain-query.certchain.svc.cluster.local:9879
+        - --listen=:8080
+        - --reconcile-interval=5m
+        # Set --namespaces to restrict which namespaces receive TLS Secrets.
+        # Leave unset to sync into all namespaces.
+        # - --namespaces=default,production
+        ports:
+        - name: webhook
+          containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 30
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: certchain-sync
+  namespace: certchain
+spec:
+  selector:
+    app: certchain-sync
+  ports:
+  - name: webhook
+    port: 8080
+    targetPort: 8080

@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,8 +41,16 @@ func main() {
 	queryAddr := flag.String("query-addr", ":9879", "HTTP query API listen address")
 	maxCerts := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
 	renewWindow := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
-	notifyURL := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
+	notifyURL   := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
+	staticPeers := flag.String("static-peers", "", "comma-separated host:port peers for cross-cluster sync")
 	flag.Parse()
+
+	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
+	// without needing a shell to build the args list.
+	if *avxURL == ""      { *avxURL = os.Getenv("AVX_URL") }
+	if *avxKey == ""      { *avxKey = os.Getenv("AVX_KEY") }
+	if *notifyURL == ""   { *notifyURL = os.Getenv("NOTIFY_URL") }
+	if *staticPeers == "" { *staticPeers = os.Getenv("STATIC_PEERS") }
 
 	id, err := crypto.LoadOrCreate(*configDir)
 	if err != nil {
@@ -52,6 +61,12 @@ func main() {
 	ch := chain.New()
 	certStore := cert.NewStore(*maxCerts)
 	peerTable := peer.NewTable()
+
+	if *staticPeers != "" {
+		seeder := peer.NewStaticPeerSeeder(peerTable, strings.Split(*staticPeers, ","))
+		seeder.Start()
+		defer seeder.Stop()
+	}
 
 	// Load persisted chain if present.
 	if err := loadChain(ch, certStore, *configDir); err != nil {

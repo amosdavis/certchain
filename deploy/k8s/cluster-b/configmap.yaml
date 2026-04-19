@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: certchain-config
+  namespace: certchain
+data:
+  # Secondary cluster: no AVX_URL/AVX_KEY — certd runs in sync-only mode.
+  # Replace with the DNS name or IP of cluster-a's internal NLB for port 9878.
+  STATIC_PEERS: "certchain-sync-svc.certchain.cluster-a.example.com:9878"
+  # certchain-sync webhook endpoint in this cluster.
+  NOTIFY_URL: "http://certchain-sync.certchain.svc.cluster.local:8080/webhook"

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: certchain-sync-svc
+  namespace: certchain
+  annotations:
+    # AWS: use an internal NLB so the sync port is reachable from other clusters
+    # via VPC peering without being exposed to the internet.
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+    # GKE equivalent:
+    # cloud.google.com/load-balancer-type: "Internal"
+spec:
+  type: LoadBalancer
+  selector:
+    app: certchain
+  ports:
+  - name: sync
+    port: 9878
+    targetPort: 9878
+    protocol: TCP

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -105,6 +106,79 @@ func (t *Table) Count() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.peers)
+}
+
+// StaticPeerSeeder injects statically-configured peers into the peer table so that
+// certchain nodes in different Kubernetes clusters can sync without UDP discovery.
+// It re-seeds every announceInterval/2 to prevent eviction by evictStale.
+type StaticPeerSeeder struct {
+	table *Table
+	addrs []string // "host:port" strings
+	stop  chan struct{}
+	wg    sync.WaitGroup
+}
+
+// NewStaticPeerSeeder creates a seeder for the given host:port addresses.
+func NewStaticPeerSeeder(table *Table, addrs []string) *StaticPeerSeeder {
+	return &StaticPeerSeeder{table: table, addrs: addrs, stop: make(chan struct{})}
+}
+
+// Start seeds peers immediately then refreshes every announceInterval/2.
+func (s *StaticPeerSeeder) Start() {
+	s.seed()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		ticker := time.NewTicker(announceInterval / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.seed()
+			case <-s.stop:
+				return
+			}
+		}
+	}()
+}
+
+// Stop shuts down the background refresh goroutine.
+func (s *StaticPeerSeeder) Stop() {
+	close(s.stop)
+	s.wg.Wait()
+}
+
+func (s *StaticPeerSeeder) seed() {
+	for _, addr := range s.addrs {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			log.Printf("static-peers: bad address %q: %v", addr, err)
+			continue
+		}
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil {
+			log.Printf("static-peers: bad port in %q: %v", addr, err)
+			continue
+		}
+		// Resolve at each refresh so DNS changes (e.g. headless Service) are picked up.
+		ips, err := net.LookupHost(host)
+		if err != nil {
+			log.Printf("static-peers: lookup %q: %v", host, err)
+			continue
+		}
+		for _, ipStr := range ips {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			s.table.Upsert(&Peer{
+				Addr:     &net.UDPAddr{IP: ip, Port: DiscoveryPort},
+				SyncPort: uint16(port),
+				LastSeen: time.Now(),
+				// PubKey left zero; MsgHello exchange fills it in on first connect.
+			})
+		}
+	}
 }
 
 // Discoverer sends and receives UDP announce messages.

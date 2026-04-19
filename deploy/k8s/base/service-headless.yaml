@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: certchain-headless
+  namespace: certchain
+spec:
+  clusterIP: None
+  selector:
+    app: certchain
+  ports:
+  - name: sync
+    port: 9878
+    protocol: TCP
+  - name: discovery
+    port: 9876
+    protocol: UDP

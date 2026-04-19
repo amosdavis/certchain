@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: certchain
+  namespace: certchain
+spec:
+  serviceName: certchain-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: certchain
+  template:
+    metadata:
+      labels:
+        app: certchain
+    spec:
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+      - name: certd
+        image: your-registry/certchain:latest
+        # All configuration is driven by env vars; see cluster-a/configmap.yaml
+        # and cluster-a/secret.yaml. certd falls back to env vars when flags are
+        # not set (AVX_URL, AVX_KEY, NOTIFY_URL, STATIC_PEERS).
+        args: ["--config", "/data/certchain"]
+        env:
+        - name: STATIC_PEERS
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: STATIC_PEERS
+        - name: NOTIFY_URL
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: NOTIFY_URL
+        # AVX credentials are optional — absent on secondary (sync-only) clusters.
+        - name: AVX_URL
+          valueFrom:
+            secretKeyRef:
+              name: certchain-avx
+              key: AVX_URL
+              optional: true
+        - name: AVX_KEY
+          valueFrom:
+            secretKeyRef:
+              name: certchain-avx
+              key: AVX_KEY
+              optional: true
+        ports:
+        - name: query
+          containerPort: 9879
+          protocol: TCP
+        - name: sync
+          containerPort: 9878
+          protocol: TCP
+        - name: discovery
+          containerPort: 9876
+          protocol: UDP
+        volumeMounts:
+        - name: certchain-data
+          mountPath: /data/certchain
+        livenessProbe:
+          httpGet:
+            path: /status
+            port: 9879
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /status
+            port: 9879
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+  volumeClaimTemplates:
+  - metadata:
+      name: certchain-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
