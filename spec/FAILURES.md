@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-22)
+# certchain Failure Mode Tenets (CM-01 to CM-23)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -393,3 +393,37 @@ operator confusion.
 **Test:** `TestRunExecutesLeaderFunction` in `internal/leader/leader_test.go`;
   integration test will be added with Phase 3 (H5) when the issuer workqueue
   is wired in.
+
+---
+
+## Category: Chain Integrity
+
+### CM-23 — Unauthorized Block Author
+
+**Risk:** Any node whose Ed25519 identity key signs a valid transaction can
+currently inject blocks into the chain. A compromised, rogue, or decommissioned
+node can therefore publish, revoke, or renew certificates — or spam blocks —
+even though operators never authorized it to act as a validator. Without an
+allowlist the chain has no notion of "who is permitted to write history,"
+and `Replace` will even accept a longer fork forged by an attacker-controlled
+keypair.
+
+**Mitigation:**
+- `chain.ValidatorSet` is an immutable set of hex-encoded Ed25519 pubkeys
+  loaded from `<config>/validators.json` (override with `--validators`).
+- `chain.Chain.SetValidators` installs the set; `AddBlock` and `Replace`
+  reject any transaction whose `NodePubkey` is not in the set with the
+  sentinel error `chain.ErrUnauthorizedAuthor`.
+- A nil `ValidatorSet` preserves the legacy accept-all behavior for
+  single-node development and pre-rollout deployments; certd logs a WARN
+  referencing CM-23 when `validators.json` is absent so operators notice.
+- Malformed `validators.json` is fatal at startup — the daemon refuses to
+  run in an ambiguous security state.
+- The allowlist is consulted **before** signature verification and payload
+  validation so unauthorized blocks are rejected cheaply and fail-closed.
+
+**Test:** `TestAddBlockRejectsUnknownSigner`, `TestAddBlockAcceptsKnownSigner`,
+  `TestReplaceRejectsUnauthorizedBlock`, `TestNilValidatorSetAcceptsAny`,
+  `TestLoadValidatorsFromFileMissing`, `TestLoadValidatorsFromFileRoundtrip`,
+  and `TestLoadValidatorsFromFileMalformed` in
+  `internal/chain/validator_test.go`.

@@ -16,10 +16,27 @@ const (
 
 // Chain is the thread-safe certchain blockchain.
 type Chain struct {
-	mu      sync.RWMutex
-	blocks  []Block
-	seqMap  map[[32]byte]uint32            // last seen nonce per node pubkey
-	rateMap map[[32]byte][]int64           // block indices of recent txs per node
+	mu         sync.RWMutex
+	blocks     []Block
+	seqMap     map[[32]byte]uint32  // last seen nonce per node pubkey
+	rateMap    map[[32]byte][]int64 // block indices of recent txs per node
+	validators *ValidatorSet       // nil = accept any signer (CM-23)
+}
+
+// SetValidators installs an allowlist of authorized block authors. A nil
+// argument disables the check, preserving the legacy accept-all behavior
+// used by unit tests and pre-CM-23 deployments.
+func (c *Chain) SetValidators(vs *ValidatorSet) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.validators = vs
+}
+
+// Validators returns the currently installed ValidatorSet (may be nil).
+func (c *Chain) Validators() *ValidatorSet {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.validators
 }
 
 // New creates a Chain initialised with the genesis block.
@@ -158,6 +175,9 @@ func (c *Chain) validateBlock(b, prev Block) error {
 		return errors.New("block hash mismatch")
 	}
 	for i := range b.Txs {
+		if !c.validators.Contains(b.Txs[i].NodePubkey) {
+			return ErrUnauthorizedAuthor
+		}
 		if err := c.validateTx(&b.Txs[i], b.Index); err != nil {
 			return err
 		}
@@ -209,17 +229,21 @@ func (c *Chain) validateChain(blocks []Block) error {
 		return errors.New("genesis block hash mismatch")
 	}
 
+	// Snapshot the validator set under RLock so SetValidators cannot race
+	// with in-flight chain validation.
+	c.mu.RLock()
+	vs := c.validators
+	c.mu.RUnlock()
+
 	seqMap := make(map[[32]byte]uint32)
 	rateMap := make(map[[32]byte][]int64)
 
-	// Temporarily swap maps for validation; restore after.
-	orig := c
 	tmp := &Chain{
-		blocks:  blocks[:1],
-		seqMap:  seqMap,
-		rateMap: rateMap,
+		blocks:     blocks[:1],
+		seqMap:     seqMap,
+		rateMap:    rateMap,
+		validators: vs,
 	}
-	_ = orig
 
 	for i := 1; i < len(blocks); i++ {
 		if err := tmp.validateBlock(blocks[i], blocks[i-1]); err != nil {

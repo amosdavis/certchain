@@ -61,6 +61,7 @@ func main() {
 	k8sSecretPrefix := flag.String("k8s-secret-prefix", "", "prefix for K8s Secret names (default: cc)")
 	k8sSignerName   := flag.String("k8s-signer-name", "", "CSR signerName to watch (default: certchain.io/appviewx)")
 	metricsAddr     := flag.String("metrics-addr", ":9880", "Address for Prometheus /metrics (H3)")
+	validatorsFile  := flag.String("validators", "", "path to validators.json allowlist (default: <config>/validators.json, CM-23)")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -96,6 +97,24 @@ func main() {
 	ch := chain.New()
 	certStore := cert.NewStore(*maxCerts)
 	peerTable := peer.NewTable()
+
+	// CM-23: load validator allowlist if configured. Missing file is a
+	// WARN (accept-all) so single-node and pre-rollout deployments keep
+	// working; a malformed file is fatal.
+	validatorsPath := *validatorsFile
+	if validatorsPath == "" {
+		validatorsPath = filepath.Join(*configDir, "validators.json")
+	}
+	vs, err := chain.LoadValidatorsFromFile(validatorsPath)
+	if err != nil {
+		log.Fatalf("certd: load validators %s: %v", validatorsPath, err)
+	}
+	if vs == nil {
+		log.Printf("certd: WARN validators.json not found at %s — chain is running in accept-all mode (CM-23)", validatorsPath)
+	} else {
+		log.Printf("certd: loaded %d authorized validators from %s (CM-23)", vs.Len(), validatorsPath)
+		ch.SetValidators(vs)
+	}
 
 	if *staticPeers != "" {
 		seeder := peer.NewStaticPeerSeeder(peerTable, strings.Split(*staticPeers, ","))
