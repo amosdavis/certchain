@@ -1,0 +1,48 @@
+# golangci-lint configuration for certchain
+# See https://golangci-lint.run/usage/configuration/
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - bodyclose
+    - rowserrcheck
+    - gosec
+    - revive
+
+linters-settings:
+  gosec:
+    excludes:
+      # G104: Errors unhandled — errcheck already covers this with better context.
+      - G104
+  revive:
+    rules:
+      - name: exported
+        disabled: true
+      - name: package-comments
+        disabled: true
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+    - path: features/
+      linters:
+        - gosec
+        - errcheck
+  max-issues-per-linter: 0
+  max-same-issues: 0
