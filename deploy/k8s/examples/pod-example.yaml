@@ -1,0 +1,45 @@
+# Example Pod that consumes the Secret produced by cert-manager.
+#
+# The Secret "app-tls" in namespace "team-a" is created and kept in sync
+# by cert-manager; this Pod mounts it read-only at /tls. On renewal the
+# Secret is updated in place — pick up new material by restarting the
+# Pod or using a sidecar that watches the mount.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+  namespace: team-a
+  labels:
+    app: app
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    fsGroup: 65532
+  containers:
+    - name: app
+      image: nginx:alpine
+      ports:
+        - name: https
+          containerPort: 8443
+      volumeMounts:
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+      env:
+        - name: TLS_CERT_FILE
+          value: /tls/tls.crt
+        - name: TLS_KEY_FILE
+          value: /tls/tls.key
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "32Mi"
+        limits:
+          cpu: "200m"
+          memory: "128Mi"
+  volumes:
+    - name: tls
+      secret:
+        secretName: app-tls
+        defaultMode: 0400

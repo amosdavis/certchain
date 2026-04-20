@@ -2,9 +2,25 @@
 
 A standalone Go blockchain application that manages TLS/SSL X.509 certificates
 issued by AppViewX and makes them available to any node on the network.
+Workloads on Kubernetes consume certs through a cert-manager external issuer
+(`certchain-issuer`), which turns `Certificate` resources into on-chain CSRs
+and writes the signed material back into Kubernetes Secrets — private keys
+never leave the cluster.
 
 certchain is independent of addrchain but shares the peer-discovery UDP port
 (9876) so addrchain nodes can perform optional soft-lookup queries.
+
+---
+
+## Quick Start (GKE)
+
+Get from an empty GKE cluster to a Pod mounting a certchain-issued TLS cert
+in ~10 minutes: **[docs/GKE-QUICKSTART.md](docs/GKE-QUICKSTART.md)**.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component diagram
+(AVX → certd chain → certchain-issuer → cert-manager → Secret → Pod) and
+trust boundaries. Sample manifests live in
+[`deploy/k8s/examples/`](deploy/k8s/examples).
 
 ---
 

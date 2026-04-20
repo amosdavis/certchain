@@ -1,0 +1,12 @@
+# Cluster-scoped issuer. Any namespace can reference this via
+# issuerRef.kind=CertchainClusterIssuer, issuerRef.group=certchain.io.
+#
+# signerName must match the --k8s-signer-name flag on certd. The pattern
+# certchain.io/<name> is enforced by the CRD OpenAPI schema (see
+# deploy/k8s/base/crds.yaml).
+apiVersion: certchain.io/v1alpha1
+kind: CertchainClusterIssuer
+metadata:
+  name: prod-issuer
+spec:
+  signerName: certchain.io/appviewx

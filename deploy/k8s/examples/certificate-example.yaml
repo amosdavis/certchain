@@ -1,0 +1,38 @@
+# cert-manager Certificate that delegates issuance to certchain.
+#
+# Flow:
+#   1. cert-manager generates a private key and stores it in Secret
+#      "app-tls" (tls.key) in namespace "team-a".
+#   2. cert-manager creates a CertificateRequest; certchain-issuer
+#      translates it into a Kubernetes CertificateSigningRequest with
+#      signerName=certchain.io/appviewx.
+#   3. certd picks up the CSR, submits to AppViewX, writes the signed
+#      chain back to the CSR status.
+#   4. cert-manager stores the signed cert as tls.crt in the same Secret.
+#   5. cert-manager auto-renews when within renewBefore of notAfter
+#      (CM-21 requires renewBefore >= 30d).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: app-tls
+  namespace: team-a
+spec:
+  secretName: app-tls
+  duration: 8760h      # 1 year
+  renewBefore: 720h    # 30 days
+  commonName: app.example.com
+  dnsNames:
+    - app.example.com
+    - www.app.example.com
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    group: certchain.io
+    kind: CertchainClusterIssuer
+    name: prod-issuer
