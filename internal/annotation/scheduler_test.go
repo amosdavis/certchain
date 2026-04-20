@@ -194,11 +194,15 @@ func TestRenewalSchedulerIntegration(t *testing.T) {
 		t.Fatalf("create secret: %v", err)
 	}
 
-	// Schedule renewal
-	sched.scheduleRenewal(context.Background(), sec)
-
-	// Advance time to renewal point (10 days from now = 30 days before expiry)
+	// Advance the fake clock past the renewal point BEFORE scheduling.
+	// The underlying workqueue's AddAfter uses real wall-clock time, so a
+	// positive computed delay would make the test wait for real time to
+	// elapse. By advancing first we make delay <= 0, causing scheduleRenewal
+	// to take the immediate AddRateLimited path.
 	fc.Advance(10*24*time.Hour + 1*time.Minute)
+
+	// Schedule renewal (delay will be <= 0, enqueued immediately).
+	sched.scheduleRenewal(context.Background(), sec)
 
 	// Process the renewal
 	ctx := context.Background()
