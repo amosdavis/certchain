@@ -47,6 +47,7 @@ func main() {
 	certdURL := flag.String("certd-url", "http://127.0.0.1:9879", "certd query API base URL used for readiness probing (CM-27); empty disables the probe")
 	readinessMaxStaleness := flag.Duration("readiness-max-staleness", 60*time.Second, "Maximum age of the last successful certd probe before /readyz returns 503 (CM-27)")
 	certdProbeInterval := flag.Duration("certd-probe-interval", 15*time.Second, "Background certd reachability probe interval for /readyz (CM-27)")
+	workers := flag.Int("workers", 2, "Number of reconcile workers pulling from the issuer workqueue (H5 / CM-31)")
 	flag.Parse()
 
 	logger := logging.New(logging.Options{
@@ -102,7 +103,7 @@ func main() {
 		// Controller setup is effectively complete as soon as Run establishes
 		// its watch; expose that as the "caches synced" readiness signal.
 		ready.SetCachesSynced(true)
-		return reconnectLoop(ctx, ctrl, *reconnectDelay, logger)
+		return reconnectLoop(ctx, ctrl, *workers, *reconnectDelay, logger)
 	}
 
 	if !*leaderElect {
@@ -132,10 +133,10 @@ func main() {
 
 // reconnectLoop runs the controller's Watch loop, reconnecting after any
 // non-fatal error. Blocks until ctx is cancelled.
-func reconnectLoop(ctx context.Context, ctrl *issuer.Controller, delay time.Duration, logger *slog.Logger) error {
-	logger.Info("starting CertificateRequest watch")
+func reconnectLoop(ctx context.Context, ctrl *issuer.Controller, workers int, delay time.Duration, logger *slog.Logger) error {
+	logger.Info("starting CertificateRequest watch", "workers", workers)
 	for {
-		if err := ctrl.Run(ctx); err != nil {
+		if err := ctrl.Run(ctx, workers); err != nil {
 			if ctx.Err() != nil {
 				logger.Info("shutting down")
 				return nil

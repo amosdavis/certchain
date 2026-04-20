@@ -71,6 +71,8 @@ func main() {
 	queryTokenFile  := flag.String("query-token-file", "", "path to a file whose contents are the Bearer token required on the HTTP query API (CM-28)")
 	chainID          := flag.String("chain-id", chain.DefaultChainID, "chainID mixed into the signature domain separator (CM-29); must match across all peers in a network")
 	acceptLegacySigs := flag.Bool("accept-legacy-sigs", true, "accept signatures in the pre-CM-29 no-domain-separator format; flip to false once all peers have re-signed (CM-29)")
+	batchMaxTxs      := flag.Int("batch-max-txs", chain.DefaultBatchMaxTxs, "maximum transactions committed in a single block by the chain.Batcher (CM-32)")
+	batchMaxWait     := flag.Duration("batch-max-wait", chain.DefaultBatchMaxWait, "maximum time the chain.Batcher will hold a partial batch before committing (CM-32)")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -182,9 +184,11 @@ func main() {
 	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey, *configDir)
 	syncer.SetBlockSecret(peerSecretBytes)
 
-	// blockSubmitter serialises all block submissions (avxPollLoop + CSRWatcher)
-	// behind a single mutex so the per-node nonce stays monotonically increasing.
-	bs := newBlockSubmitter(ch, certStore, id, syncer, *configDir)
+	// blockSubmitter batches all block submissions (avxPollLoop + CSRWatcher)
+	// through chain.Batcher so bursts commit as a single multi-tx block and
+	// the per-node nonce stays monotonically increasing (CM-32).
+	bs := newBlockSubmitter(ch, certStore, id, syncer, *configDir, *batchMaxTxs, *batchMaxWait)
+	defer bs.Stop()
 
 	// AppViewX client — shared between poll loop and K8s CSR watcher.
 	var avxClient *avx.Client
@@ -416,20 +420,22 @@ func (r *certdReadiness) ServeReadyz(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// blockSubmitter serialises block submissions from concurrent goroutines
-// (avxPollLoop and CSRWatcher) behind a single mutex so the per-node nonce
-// stays monotonically increasing.
+// blockSubmitter groups block submissions from concurrent goroutines
+// (avxPollLoop and CSRWatcher) through a chain.Batcher so bursts commit
+// as a single multi-tx block (CM-32). The Batcher drain goroutine is
+// single-threaded, so SignTx assigns the per-node nonce without a mutex;
+// per-batch rollback on a failed commit keeps the counter monotonic.
 type blockSubmitter struct {
-	mu        sync.Mutex
 	nonce     uint32
 	ch        *chain.Chain
 	id        *crypto.Identity
 	certStore *cert.Store
 	syncer    *peer.Syncer
 	configDir string
+	batcher   *chain.Batcher
 }
 
-func newBlockSubmitter(ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string) *blockSubmitter {
+func newBlockSubmitter(ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, batchMaxTxs int, batchMaxWait time.Duration) *blockSubmitter {
 	bs := &blockSubmitter{
 		ch: ch, certStore: certStore, id: id, syncer: syncer, configDir: configDir,
 	}
@@ -441,44 +447,61 @@ func newBlockSubmitter(ch *chain.Chain, certStore *cert.Store, id *crypto.Identi
 			}
 		}
 	}
+	bs.batcher = chain.NewBatcher(context.Background(), ch, chain.BatcherConfig{
+		MaxTxs:  batchMaxTxs,
+		MaxWait: batchMaxWait,
+		Signer:  bs,
+		OnBlock: bs.onBlockCommitted,
+	})
 	return bs
 }
 
-// Submit adds a transaction to the chain. tx must have Type and Payload set;
-// NodePubkey, Timestamp, Nonce, and Signature are assigned under the mutex,
-// preventing duplicate nonces when multiple goroutines submit concurrently.
-func (bs *blockSubmitter) Submit(tx chain.Transaction) error {
-	bs.mu.Lock()
+// SignTx implements chain.Signer. It assigns this node's pubkey, the
+// current timestamp, and a monotonically increasing nonce, then signs
+// the transaction under the chain's current signing context (CM-29).
+// Called exclusively from the Batcher drain goroutine.
+func (bs *blockSubmitter) SignTx(tx *chain.Transaction) {
 	bs.nonce++
-	tx.Nonce = bs.nonce
 	tx.NodePubkey = bs.id.PublicKey
 	tx.Timestamp = chain.Now()
-	chain.Sign(&tx, bs.id)
+	tx.Nonce = bs.nonce
+	chain.Sign(tx, bs.id)
+}
 
-	tip := bs.ch.Tip()
-	blk := chain.Block{
-		Index:     tip.Index + 1,
-		Timestamp: chain.Now(),
-		PrevHash:  tip.Hash,
-		Txs:       []chain.Transaction{tx},
-	}
-	blk.Hash = chain.ComputeHash(&blk)
+// OnBatchRollback implements chain.Signer. When BatchSubmit rejects the
+// batch, every nonce advanced in SignTx is rolled back so the next batch
+// reuses the same nonce range; without this the chain would forever
+// reject this node's subsequent submissions for nonce-replay.
+func (bs *blockSubmitter) OnBatchRollback(n int) {
+	bs.nonce -= uint32(n)
+}
 
-	addErr := bs.ch.AddBlock(blk)
-	if addErr != nil {
-		bs.nonce--
-	}
-	bs.mu.Unlock()
-
-	if addErr != nil {
-		return addErr
-	}
+// onBlockCommitted is the Batcher's post-commit hook. It mirrors the
+// pre-CM-32 per-block side-effects: cert-store apply, peer push, and
+// persistent save.
+func (bs *blockSubmitter) onBlockCommitted(blk chain.Block) {
 	if err := bs.certStore.ApplyBlock(blk); err != nil {
 		log.Printf("certd: cert store apply block: %v", err)
 	}
 	bs.syncer.PushBlockToPeers(blk)
 	_ = saveChain(bs.ch, bs.configDir)
-	return nil
+}
+
+// Submit adds a transaction to the chain via the Batcher. tx must have
+// Type and Payload set; NodePubkey, Timestamp, Nonce, and Signature are
+// filled in by SignTx inside the drain goroutine, preventing duplicate
+// nonces when multiple goroutines submit concurrently. Submit blocks
+// until the batch containing tx has been committed (or rejected).
+func (bs *blockSubmitter) Submit(tx chain.Transaction) error {
+	return bs.batcher.Submit(tx)
+}
+
+// Stop flushes any queued txs and releases the Batcher drain goroutine.
+// Safe to call multiple times.
+func (bs *blockSubmitter) Stop() {
+	if bs.batcher != nil {
+		bs.batcher.Stop()
+	}
 }
 
 // avxPollLoop polls AppViewX and publishes new/revoked/renewed certs to the chain.

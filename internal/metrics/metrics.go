@@ -124,9 +124,13 @@ func NewAVXMetrics(r *Registry) *AVXMetrics {
 
 // IssuerMetrics collects cert-manager issuer controller metrics.
 type IssuerMetrics struct {
-	RequestsTotal  *prometheus.CounterVec
-	ReconcileSecs  prometheus.Histogram
-	PendingGauge   prometheus.Gauge
+	RequestsTotal       *prometheus.CounterVec
+	ReconcileSecs       prometheus.Histogram
+	PendingGauge        prometheus.Gauge
+	WorkqueueDepth      prometheus.Gauge
+	WorkqueueAdds       prometheus.Counter
+	WorkqueueRetries    prometheus.Counter
+	ReconcileDurationSecs prometheus.Histogram
 }
 
 // NewIssuerMetrics registers and returns issuer metrics.
@@ -151,7 +155,35 @@ func NewIssuerMetrics(r *Registry) *IssuerMetrics {
 			Name:      "pending_requests",
 			Help:      "Current number of pending CertificateRequests observed.",
 		}),
+		WorkqueueDepth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "certchain",
+			Subsystem: "issuer",
+			Name:      "workqueue_depth",
+			Help:      "Current depth of the issuer workqueue (H5).",
+		}),
+		WorkqueueAdds: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "certchain",
+			Subsystem: "issuer",
+			Name:      "workqueue_adds_total",
+			Help:      "Total number of adds to the issuer workqueue (H5).",
+		}),
+		WorkqueueRetries: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "certchain",
+			Subsystem: "issuer",
+			Name:      "workqueue_retries_total",
+			Help:      "Total number of rate-limited retries on the issuer workqueue (H5).",
+		}),
+		ReconcileDurationSecs: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: "certchain",
+			Subsystem: "issuer",
+			Name:      "reconcile_duration_seconds",
+			Help:      "Duration of a single issuer reconcile attempt from the workqueue (H5).",
+			Buckets:   prometheus.ExponentialBuckets(0.01, 2, 10),
+		}),
 	}
-	r.MustRegister(m.RequestsTotal, m.ReconcileSecs, m.PendingGauge)
+	r.MustRegister(
+		m.RequestsTotal, m.ReconcileSecs, m.PendingGauge,
+		m.WorkqueueDepth, m.WorkqueueAdds, m.WorkqueueRetries, m.ReconcileDurationSecs,
+	)
 	return m
 }

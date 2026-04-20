@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-31)
+# certchain Failure Mode Tenets (CM-01 to CM-33)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -768,3 +768,118 @@ deployment-surface-only. `kubectl apply --dry-run=client -k
 deploy/k8s/base/` structurally validates the full manifest set against the
 in-cluster schema when kubectl is available; otherwise YAML parse
 correctness is verified via `kustomize build deploy/k8s/base`.
+
+---
+
+## Category: Chain Throughput
+
+### CM-32 — One Tx Per Block Inflates Chain to O(N) Blocks per Burst
+
+**Risk:** The pre-CM-32 submit path built one block per transaction. A
+proactive-renewal sweep, a large CSR burst, or any operator action that
+fans out many cert mutations in a short window therefore produced N
+blocks for N txs. Three concrete failures follow:
+- Persisted `chain.json` grows linearly with the submission rate rather
+  than with the cert population, pushing PVC usage past its reservation
+  and starving other writers.
+- Peer block-push fan-out multiplies by N: every peer receives N HTTP
+  pushes (each with its own HMAC, TLS handshake budget, and certd query
+  side-effects) for what is logically one batch of work.
+- Block-index pressure: index is a uint32, so a node that sustains
+  1 tx/s hits the 2^32 ceiling in ~136 years. That is nominally safe
+  today, but it is trivially halved by anyone who can drive the submit
+  path (CSR watcher, AVX poll sweep) at peak rate, and once indices
+  wrap, validation (`b.Index != prev.Index+1`) rejects every subsequent
+  block network-wide.
+
+**Mitigation:**
+- `chain.BatchSubmit(ctx, []Transaction)` atomically commits a single
+  multi-tx block. Canonical block bytes (and therefore the CM-29 block
+  hash) fold every tx's signing payload in, so block-level integrity
+  still covers the full batch; per-tx signatures continue to verify
+  individually under the domain-separated context.
+- `chain.Batcher` sits in front of `BatchSubmit`. Producers call
+  `Submit(tx)` and block on a per-tx promise; the Batcher's single
+  drain goroutine collects pending txs until `--batch-max-txs`
+  transactions are queued or `--batch-max-wait` elapses (defaults 64
+  and 250 ms), then commits them as one block. Because the drain loop
+  is single-threaded, the `Signer` hook assigns monotonic per-node
+  nonces lock-free and in commit order.
+- certd's `blockSubmitter` implements `chain.Signer`: it advances the
+  node nonce inside `SignTx` and rolls it back via `OnBatchRollback`
+  when a batch is rejected, preserving the replay-prevention invariant
+  from CM-03 without the pre-CM-32 per-tx mutex.
+- On shutdown, the Batcher drains any queued txs and either commits or
+  errors every promise so no caller is left blocked on an unresolved
+  reply — the shutdown-flush guarantee tested by
+  `TestBatcherShutdownFlushesPending`.
+
+**Test:** `internal/chain/batcher_test.go` covers
+`TestBatcherDrainsOnFull` (64-tx full-buffer drain producing one block),
+`TestBatcherDrainsOnDeadline` (3-tx partial batch committed once
+`MaxWait` expires), `TestBatcherPreservesOrder` (tx order in the
+committed block matches submit order and nonce sequence),
+`TestBatcherErrorPropagation` (a single invalid tx makes the whole
+batch fail with one shared error delivered to every promise and leaves
+the chain untouched), and `TestBatcherShutdownFlushesPending` (ctx
+cancel resolves every in-flight promise). `go build ./...`,
+`go vet ./...`, and `go test -count=1 ./...` continue to pass.
+
+
+---
+
+## Category: Annotation-Driven Delivery Path
+
+### CM-33 — Annotation Path Without Explicit Opt-In Causes Secret Ownership Ambiguity
+
+**Risk:** annotation-ctrl (cmd/annotation-ctrl) watches Pods and Services
+for the `certchain.io/cert-cn` annotation and provisions a
+`kubernetes.io/tls` Secret in the same namespace. If it silently
+competes with certd's legacy writer (CM-30) or cert-manager's external
+issuer (cmd/certchain-issuer) on the same Secret name, operators cannot
+tell which controller owns the material, renewals race, and a single
+revocation can trigger conflicting Events from two sources. CM-30
+covered the legacy writer's deprecation; CM-33 is the forward-looking
+contract for the annotation path itself: it must claim a distinct,
+explicit label/annotation namespace and must refuse to hijack Secrets
+it does not already own.
+
+**Mitigation:**
+- Opt-in is per-object: the controller acts only when the
+  `certchain.io/cert-cn` annotation is present. Absence of the
+  annotation is a no-op plus a scoped sweep (deletes only Secrets
+  labelled `certchain.io/managed-by=annotation-ctrl` and owned by the
+  object via `ownerReferences`).
+- All managed Secrets carry
+  `certchain.io/managed-by=annotation-ctrl` and
+  `certchain.io/cn=<sanitized-cn>`. The `managed-by` value is
+  deliberately distinct from certd's `certd` value so the two control
+  loops cannot target the same Secret.
+- If a Secret with the target name exists but does not carry the
+  annotation-ctrl `managed-by` label, the reconciler refuses to write
+  and surfaces an Event of reason `CertchainSecretError`. This is the
+  explicit-opt-in contract: the controller will not hijack a Secret it
+  did not create.
+- Secrets are emitted as `kubernetes.io/tls` with `tls.crt` +
+  `ca.crt` populated from certd's Bearer-authenticated query API
+  (CM-28). Private-key delivery is not yet implemented by this
+  controller; `tls.key` contains a well-known placeholder until the
+  separate `native-ann-renewal` task wires a private-key source. The
+  placeholder is documented in code (`annotation.KeyPlaceholder`) so
+  consumers cannot mistake the Secret for a fully-provisioned TLS
+  Secret.
+- A `RenewalNotifier` interface is exposed by the reconciler so the
+  renewal scheduler (`native-ann-renewal`) can hook in without this
+  controller having to watch the apiserver a second time. The default
+  `NopRenewalNotifier` keeps the reconcile path self-contained.
+
+**Test:** `internal/annotation/reconciler_test.go` covers (a)
+annotation-add creates a TLS Secret with the expected labels/owner
+references, (b) annotation-remove deletes only Secrets this controller
+owns (the scoped analogue of certd's CM-25 sweep), (c) CN-mismatch on
+a pinned Secret name updates material and the CN label without
+hijacking a foreign Secret, (d) certd unreachable returns an error and
+increments `certchain_annotation_errors_total` plus emits a
+`CertchainSecretError` Event, and (e) `NotFound` from certd is
+not counted as an error because it's the expected state during
+initial issuance.

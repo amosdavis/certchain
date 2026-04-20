@@ -18,9 +18,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amosdavis/certchain/internal/logging"
@@ -35,6 +38,8 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var (
@@ -59,6 +64,10 @@ const (
 	defaultPollInterval     = 5 * time.Second
 	defaultCertWaitTimeout  = 10 * time.Minute
 	defaultSignerName       = "certchain.io/appviewx"
+	// defaultMaxRetries caps the number of workqueue retries for a single
+	// CertificateRequest key before certchain-issuer emits a CertchainGiveUp
+	// Event and drops the key (CM-31).
+	defaultMaxRetries = 5
 )
 
 // Controller reconciles cert-manager CertificateRequest objects.
@@ -69,6 +78,23 @@ type Controller struct {
 	certTimeout  time.Duration
 	logger       *slog.Logger
 	metrics      *metrics.IssuerMetrics
+
+	// Workqueue + worker pool (H5 / CM-31). queue is created lazily by
+	// Run or initQueue so tests that invoke reconcile directly still work.
+	queueOnce sync.Once
+	queue     workqueue.RateLimitingInterface
+
+	// maxRetries caps rate-limited retries per key (default 5).
+	maxRetries int
+
+	// reconcileKeyFn is the worker callback; swappable in tests. When nil,
+	// the controller's real reconcileKey is used.
+	reconcileKeyFn func(ctx context.Context, key string) error
+
+	// cachesSynced is flipped to true after the informer's WaitForCacheSync
+	// (or the initial List on the dynamic watch) returns. P5 readiness
+	// reads this via CachesSynced().
+	cachesSynced atomic.Bool
 }
 
 // NewController creates a Controller.
@@ -79,6 +105,7 @@ func NewController(dynClient dynamic.Interface, k8sClient kubernetes.Interface) 
 		pollInterval: defaultPollInterval,
 		certTimeout:  defaultCertWaitTimeout,
 		logger:       logging.Discard(),
+		maxRetries:   defaultMaxRetries,
 	}
 }
 
@@ -108,37 +135,268 @@ func (c *Controller) WithCertTimeout(d time.Duration) *Controller {
 	return c
 }
 
-// Run starts the watch loop and blocks until ctx is cancelled.
-func (c *Controller) Run(ctx context.Context) error {
-	// List all namespaces — use "" for cluster-wide watch.
+// WithMaxRetries overrides the workqueue give-up threshold (default 5).
+func (c *Controller) WithMaxRetries(n int) *Controller {
+	if n > 0 {
+		c.maxRetries = n
+	}
+	return c
+}
+
+// WithReconcileKeyFunc overrides the per-key worker callback. Used in tests
+// to exercise burst / retry / give-up paths without the full reconcile.
+func (c *Controller) WithReconcileKeyFunc(fn func(ctx context.Context, key string) error) *Controller {
+	c.reconcileKeyFn = fn
+	return c
+}
+
+// CachesSynced reports whether the controller has finished its initial
+// cache sync. Used by /readyz (P5 / CM-27) — always reads atomically, never
+// blocks.
+func (c *Controller) CachesSynced() bool {
+	return c.cachesSynced.Load()
+}
+
+// Queue exposes the rate-limiting workqueue. Lazily created. Callers may
+// use it to enqueue keys before Run (e.g. tests).
+func (c *Controller) Queue() workqueue.RateLimitingInterface {
+	c.initQueue()
+	return c.queue
+}
+
+func (c *Controller) initQueue() {
+	c.queueOnce.Do(func() {
+		c.queue = workqueue.NewNamedRateLimitingQueue(
+			workqueue.DefaultControllerRateLimiter(),
+			"certchain-issuer",
+		)
+	})
+}
+
+// Run starts the workqueue + worker pool and blocks until ctx is cancelled.
+// workers must be >= 1; values <=0 are clamped to 1 to preserve the legacy
+// serial behaviour.
+func (c *Controller) Run(ctx context.Context, workers int) error {
+	if workers < 1 {
+		workers = 1
+	}
+	c.initQueue()
+
+	// Ensure ShutDown runs exactly once even on early-exit paths.
+	var shutOnce sync.Once
+	shutdown := func() { shutOnce.Do(func() { c.queue.ShutDown() }) }
+	defer shutdown()
+
+	// Establish the CertificateRequest watch. A full informer would be
+	// preferable long-term, but the dynamic watch matches what the fake
+	// dynamic client supports and what certchain-issuer has used since M1.
 	watcher, err := c.dynClient.Resource(certificateRequestGVR).Namespace("").Watch(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("watch CertificateRequests: %w", err)
 	}
 	defer watcher.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				return fmt.Errorf("CertificateRequest watch channel closed")
+	// After the watch is established, caches are effectively synced for the
+	// purposes of P5 readiness — an informer's WaitForCacheSync would be
+	// the direct analogue.
+	c.cachesSynced.Store(true)
+
+	// Start the worker pool.
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for c.processNextItem(ctx) {
 			}
-			if event.Type != watch.Added && event.Type != watch.Modified {
-				continue
+		}(i)
+	}
+
+	// Enqueue loop: translate watch events into workqueue keys.
+	enqueueDone := make(chan struct{})
+	go func() {
+		defer close(enqueueDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-watcher.ResultChan():
+				if !ok {
+					return
+				}
+				if event.Type != watch.Added && event.Type != watch.Modified {
+					continue
+				}
+				cr, ok := event.Object.(*unstructured.Unstructured)
+				if !ok {
+					continue
+				}
+				c.enqueueCR(cr)
 			}
-			cr, ok := event.Object.(*unstructured.Unstructured)
-			if !ok {
-				continue
-			}
-			go c.reconcile(ctx, cr)
 		}
+	}()
+
+	// Wait for shutdown signal, then drain workers.
+	<-ctx.Done()
+	shutdown()
+	<-enqueueDone
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// enqueueCR adds a CertificateRequest namespaced-name key to the queue.
+// Guard filters (wrong issuer group, already-issued, failed) are applied
+// lazily in the worker so that late-arriving status updates are still
+// processed.
+func (c *Controller) enqueueCR(cr *unstructured.Unstructured) {
+	key, err := cache.MetaNamespaceKeyFunc(cr)
+	if err != nil {
+		c.logger.Warn("cannot form workqueue key", "err", err)
+		return
+	}
+	c.initQueue()
+	c.queue.Add(key)
+	if c.metrics != nil {
+		c.metrics.WorkqueueAdds.Inc()
+		c.metrics.WorkqueueDepth.Set(float64(c.queue.Len()))
 	}
 }
 
-// reconcile processes a single CertificateRequest.
-func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructured) {
+// processNextItem pulls one key, runs the reconcile, and handles retry /
+// forget bookkeeping. Returns false when the queue has shut down so the
+// worker loop can exit.
+func (c *Controller) processNextItem(ctx context.Context) bool {
+	c.initQueue()
+	keyObj, shutdown := c.queue.Get()
+	if shutdown {
+		return false
+	}
+	defer c.queue.Done(keyObj)
+
+	key, ok := keyObj.(string)
+	if !ok {
+		c.queue.Forget(keyObj)
+		return true
+	}
+
+	start := time.Now()
+	fn := c.reconcileKeyFn
+	if fn == nil {
+		fn = c.reconcileKey
+	}
+	err := fn(ctx, key)
+	if c.metrics != nil {
+		c.metrics.ReconcileDurationSecs.Observe(time.Since(start).Seconds())
+		c.metrics.WorkqueueDepth.Set(float64(c.queue.Len()))
+	}
+	c.handleErr(ctx, err, key)
+	return true
+}
+
+// handleErr implements the standard controller retry policy: Forget on
+// success, AddRateLimited on error until NumRequeues exceeds maxRetries,
+// then emit a CertchainGiveUp Event and Forget.
+func (c *Controller) handleErr(ctx context.Context, err error, key string) {
+	if err == nil {
+		c.queue.Forget(key)
+		return
+	}
+	if c.queue.NumRequeues(key) < c.maxRetries {
+		c.logger.Info("requeue CertificateRequest after error",
+			"key", key, "retries", c.queue.NumRequeues(key), "err", err)
+		c.queue.AddRateLimited(key)
+		if c.metrics != nil {
+			c.metrics.WorkqueueRetries.Inc()
+		}
+		return
+	}
+	c.logger.Error("giving up on CertificateRequest after max retries",
+		"key", key, "max_retries", c.maxRetries, "err", err)
+	c.recordOutcome("give_up")
+	if evErr := c.emitGiveUpEvent(ctx, key, err); evErr != nil {
+		c.logger.Warn("emit give-up event failed", "key", key, "err", evErr)
+	}
+	c.queue.Forget(key)
+}
+
+// reconcileKey is the default per-key worker: it fetches the CR and
+// dispatches to reconcile. A NotFound CR (already deleted) is treated as a
+// success to drop the key from the queue.
+func (c *Controller) reconcileKey(ctx context.Context, key string) error {
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return fmt.Errorf("split key %q: %w", key, err)
+	}
+	cr, err := c.dynClient.Resource(certificateRequestGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get CertificateRequest %s/%s: %w", ns, name, err)
+	}
+	return c.reconcile(ctx, cr)
+}
+
+// emitGiveUpEvent records a Warning Event on the CertificateRequest
+// identified by key. Idempotent via deterministic Event name.
+func (c *Controller) emitGiveUpEvent(ctx context.Context, key string, cause error) error {
+	if c.k8sClient == nil {
+		return nil
+	}
+	ns, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	// Best-effort Get to recover UID; proceed with an empty UID rather than
+	// failing the give-up signal.
+	cr, getErr := c.dynClient.Resource(certificateRequestGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	uid := ""
+	if getErr == nil && cr != nil {
+		uid = string(cr.GetUID())
+	}
+	evName := "certchain-giveup-" + uid
+	if uid == "" {
+		evName = "certchain-giveup-" + name
+	}
+	now := metav1.Now()
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      evName,
+			Namespace: ns,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "CertificateRequest",
+			APIVersion: "cert-manager.io/v1",
+			Namespace:  ns,
+			Name:       name,
+		},
+		Reason:         "CertchainGiveUp",
+		Message:        fmt.Sprintf("giving up after %d retries: %v", c.maxRetries, cause),
+		Type:           corev1.EventTypeWarning,
+		Source:         corev1.EventSource{Component: "certchain-issuer"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	if getErr == nil && cr != nil {
+		ev.InvolvedObject.UID = cr.GetUID()
+	}
+	_, cerr := c.k8sClient.CoreV1().Events(ns).Create(ctx, ev, metav1.CreateOptions{})
+	if k8serrors.IsAlreadyExists(cerr) {
+		return nil
+	}
+	return cerr
+}
+
+// reconcile processes a single CertificateRequest. Returns nil on success
+// or a no-op skip; returns an error to signal a retry-worthy transient
+// failure. Status patching for terminal outcomes (Failed condition) happens
+// inline before the nil return so that a single success does not re-queue.
+func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructured) error {
 	name := cr.GetName()
 	ns := cr.GetNamespace()
 	uid := string(cr.GetUID())
@@ -146,18 +404,18 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 	// Guard: must be for certchain.io issuer group.
 	issuerGroup, _, _ := unstructured.NestedString(cr.Object, "spec", "issuerRef", "group")
 	if issuerGroup != "certchain.io" {
-		return
+		return nil
 	}
 
 	// Guard: skip if cert is already set.
 	existingCert, _, _ := unstructured.NestedString(cr.Object, "status", "certificate")
 	if existingCert != "" {
-		return
+		return nil
 	}
 
 	// Guard: skip if already failed (has a Failed condition).
 	if hasCRCondition(cr, "Failed") {
-		return
+		return nil
 	}
 
 	// Resolve issuer and patch its Ready status condition.
@@ -166,7 +424,9 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		c.logger.Info("skip CertificateRequest: cannot resolve issuer", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("issuer_unresolved")
 		_ = c.patchIssuerStatus(ctx, ri, false, "NotReady", err.Error())
-		return
+		// Unresolved issuer is terminal for this reconcile pass; the
+		// workqueue will revisit on the next CR event.
+		return nil
 	}
 	_ = c.patchIssuerStatus(ctx, ri, true, "Available", "certchain-issuer is reconciling CertificateRequests")
 	signerName := ri.signerName
@@ -181,7 +441,7 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 			c.logger.Error("CR spec.request is not valid base64", "namespace", ns, "name", name, "err", err)
 			c.recordOutcome("invalid_csr_encoding")
 			_ = c.patchFailed(ctx, ns, name, "spec.request is not valid base64")
-			return
+			return nil
 		}
 	}
 
@@ -191,13 +451,13 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 	if err := CreateCSR(ctx, c.k8sClient, csrName, signerName, csrDER); err != nil {
 		c.logger.Error("create K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("create_csr_failed")
-		return
+		return fmt.Errorf("create K8s CSR %s: %w", csrName, err)
 	}
 
 	if err := ApproveCSR(ctx, c.k8sClient, csrName); err != nil {
 		c.logger.Error("approve K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("approve_csr_failed")
-		return
+		return fmt.Errorf("approve K8s CSR %s: %w", csrName, err)
 	}
 
 	// M8: emit an auditable Event on the CertificateRequest recording that
@@ -215,15 +475,16 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		c.logger.Error("wait for cert failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("wait_cert_failed")
 		_ = c.patchFailed(ctx, ns, name, err.Error())
-		return
+		return nil
 	}
 
 	if err := c.patchApproved(ctx, ns, name, certPEM, ri.kind, ri.name); err != nil {
 		c.logger.Error("patch CertificateRequest failed", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("patch_failed")
-		return
+		return fmt.Errorf("patch CR %s/%s: %w", ns, name, err)
 	}
 	c.recordOutcome("issued")
+	return nil
 }
 
 func (c *Controller) recordOutcome(outcome string) {

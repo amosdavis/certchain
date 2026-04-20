@@ -4,6 +4,7 @@ BINARY_CERTD            = bin/certd
 BINARY_CERTCTL          = bin/certctl
 BINARY_CERTCHAIN_ISSUER = bin/certchain-issuer
 BINARY_CERTCHAIN_SYNC   = bin/certchain-sync
+BINARY_ANNOTATION_CTRL  = bin/annotation-ctrl
 
 GO            ?= go
 GOLANGCI_LINT ?= golangci-lint
@@ -13,7 +14,7 @@ STATICCHECK   ?= staticcheck
 
 all: build test
 
-build: $(BINARY_CERTD) $(BINARY_CERTCTL) $(BINARY_CERTCHAIN_ISSUER) $(BINARY_CERTCHAIN_SYNC)
+build: $(BINARY_CERTD) $(BINARY_CERTCTL) $(BINARY_CERTCHAIN_ISSUER) $(BINARY_CERTCHAIN_SYNC) $(BINARY_ANNOTATION_CTRL)
 
 $(BINARY_CERTD):
 	@mkdir -p bin
@@ -30,6 +31,10 @@ $(BINARY_CERTCHAIN_ISSUER):
 $(BINARY_CERTCHAIN_SYNC):
 	@mkdir -p bin
 	$(GO) build -o $(BINARY_CERTCHAIN_SYNC) ./cmd/certchain-sync
+
+$(BINARY_ANNOTATION_CTRL):
+	@mkdir -p bin
+	$(GO) build -o $(BINARY_ANNOTATION_CTRL) ./cmd/annotation-ctrl
 
 test:
 	$(GO) test -race -count=1 ./...
