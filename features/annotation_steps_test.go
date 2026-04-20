@@ -135,7 +135,7 @@ func (w *world) aPodInNamespaceWithAnnotationSetTo(name, namespace, annotationKe
 
 func (w *world) aPodInNamespaceWithAnnotations(name, namespace string, table *godog.Table) error {
 	annotations := make(map[string]string)
-	for i := 1; i < len(table.Rows); i++ {
+	for i := 0; i < len(table.Rows); i++ {
 		if len(table.Rows[i].Cells) >= 2 {
 			key := table.Rows[i].Cells[0].Value
 			value := table.Rows[i].Cells[1].Value
@@ -387,14 +387,63 @@ func (w *world) theRenewalSchedulerProcessesTheSecret() error {
 	if cn == "" {
 		return fmt.Errorf("secret missing CN label")
 	}
+
+	// Mirror scheduler behavior: only renew when NotAfter is within
+	// renewBefore. Otherwise this is a no-op (no fetch, no event),
+	// matching the production scheduler's delay>0 -> AddAfter path.
+	notAfter, err := parseCertNotAfter(secret.Data[corev1.TLSCertKey])
+	if err != nil {
+		return fmt.Errorf("parse cert NotAfter: %w", err)
+	}
+	renewBefore := w.annotationRenewBefore
+	if renewBefore == 0 {
+		renewBefore = 30 * 24 * time.Hour
+	}
+	if time.Until(notAfter) > renewBefore {
+		return nil
+	}
+
 	bundle, err := w.annotationFetcher.Fetch(context.Background(), cn)
 	if err != nil {
 		return err
 	}
 	secret.Data[corev1.TLSCertKey] = bundle.CertPEM
 	secret.Data["ca.crt"] = bundle.ChainPEM
-	_, err = w.k8sClient.CoreV1().Secrets(secret.Namespace).Update(context.Background(), secret, metav1.UpdateOptions{})
-	return err
+	if _, err := w.k8sClient.CoreV1().Secrets(secret.Namespace).Update(context.Background(), secret, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	// Emit the renewal event the real scheduler would emit.
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secret.Name + ".renewed",
+			Namespace: secret.Namespace,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:      "Secret",
+			Namespace: secret.Namespace,
+			Name:      secret.Name,
+		},
+		Reason:  annotation.EventReasonRenewed,
+		Type:    corev1.EventTypeNormal,
+		Message: "renewed TLS Secret for CN=" + cn,
+	}
+	if _, err := w.k8sClient.CoreV1().Events(secret.Namespace).Create(context.Background(), ev, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseCertNotAfter extracts NotAfter from a PEM-encoded cert.
+func parseCertNotAfter(certPEM []byte) (time.Time, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return time.Time{}, fmt.Errorf("failed to decode PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return cert.NotAfter, nil
 }
 
 func (w *world) certFetcherIsCalledForAFreshCert() error {
