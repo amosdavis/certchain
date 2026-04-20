@@ -14,9 +14,32 @@ spec:
         app: certchain-sync
     spec:
       serviceAccountName: certchain-sync
+      # Pod-level securityContext (CM-31): unprivileged UID/GID + RuntimeDefault
+      # seccomp so the pod conforms to the namespace's restricted PodSecurity
+      # profile.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: certchain-sync
         image: your-registry/certchain:latest
+        # Container-level securityContext (CM-31): drop all caps, read-only
+        # root FS, no privilege escalation. Writable paths come from the tmp
+        # tmpfs volume below.
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         command: ["/usr/local/bin/certchain-sync"]
         args:
         - --certd-url=http://certchain-query.certchain.svc.cluster.local:9879
@@ -28,6 +51,9 @@ spec:
         ports:
         - name: webhook
           containerPort: 8080
+        - name: metrics
+          containerPort: 9880
+          protocol: TCP
         livenessProbe:
           httpGet:
             path: /healthz
@@ -40,6 +66,14 @@ spec:
           limits:
             memory: "128Mi"
             cpu: "200m"
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
 ---
 apiVersion: v1
 kind: Service

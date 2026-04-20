@@ -1,0 +1,177 @@
+# NetworkPolicies (CM-31): lock down the certchain namespace so only the
+# communication patterns explicitly enumerated below are permitted. Anything
+# else — lateral movement from a compromised sidecar, cluster-wide scraping,
+# exfiltration to arbitrary egress targets — is dropped at the CNI.
+#
+# A NetworkPolicy in a namespace denies all traffic on the dimensions it
+# selects (ingress and/or egress) unless a policy explicitly permits it. We
+# start with a default-deny baseline and layer allow rules on top per
+# workload.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: certchain
+spec:
+  # Selecting all pods with no ingress or egress rules denies both directions
+  # by default. Specific allow policies below re-open the exact flows the
+  # system requires.
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# certd (StatefulSet "certchain", app=certchain) ingress allow-list.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-certd-ingress
+  namespace: certchain
+spec:
+  podSelector:
+    matchLabels:
+      app: certchain
+  policyTypes:
+  - Ingress
+  ingress:
+  # Query API (9879) — reachable from the certchain-issuer controller, any
+  # pod in the certchain namespace (sync, peer certd replicas), and kube-system
+  # (for kubelet scrapers / built-in probes).
+  - from:
+    - podSelector:
+        matchLabels:
+          app: certchain-issuer
+    - podSelector:
+        matchLabels:
+          app: certchain-sync
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: certchain
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 9879
+      protocol: TCP
+  # Metrics (9880) — only Prometheus scrapers. A namespace must advertise
+  # `prometheus: enabled` to be trusted as a scrape source.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          prometheus: enabled
+    ports:
+    - port: 9880
+      protocol: TCP
+  # Peer sync (9878) — strictly same-app peers. Cross-cluster peers reach the
+  # port via the dedicated internal LoadBalancer (service-sync.yaml); the
+  # CNI-level allow-list for that off-cluster traffic is enforced by the
+  # cloud LB's source-range / security-group config and is out of scope for
+  # this NetworkPolicy.
+  - from:
+    - podSelector:
+        matchLabels:
+          app: certchain
+    ports:
+    - port: 9878
+      protocol: TCP
+---
+# certchain-issuer ingress allow-list.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-issuer-ingress
+  namespace: certchain
+spec:
+  podSelector:
+    matchLabels:
+      app: certchain-issuer
+  policyTypes:
+  - Ingress
+  ingress:
+  # Webhook endpoint (9443) — reachable from the kube-apiserver. The apiserver
+  # sources from the control-plane network, which we approximate by allowing
+  # kube-system namespace (works on kind/EKS/GKE where apiserver proxies
+  # through a kube-system service). Operators on clusters with a different
+  # apiserver source must widen this selector.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 9443
+      protocol: TCP
+  # Metrics (9880) — Prometheus scrapers only.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          prometheus: enabled
+    ports:
+    - port: 9880
+      protocol: TCP
+---
+# Namespace-wide egress allow-list. Applies to every pod in certchain so
+# certd, certchain-issuer, and certchain-sync all share the same outbound
+# surface.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-common
+  namespace: certchain
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  # DNS — every pod needs cluster DNS for service resolution.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # kube-apiserver — the issuer and sync controllers call into the apiserver
+  # over HTTPS. Clusters expose the apiserver via different CIDRs; the two
+  # common cases are a kube-system Service endpoint and a control-plane VIP.
+  # Allowing both the kube-system namespace (for the in-cluster "kubernetes"
+  # Service endpoints slice) and TCP/443/6443 to any destination captures
+  # both patterns without opening arbitrary HTTPS egress.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 443
+      protocol: TCP
+    - port: 6443
+      protocol: TCP
+  # Same-namespace egress — certchain-issuer → certd query (9879),
+  # certchain-sync → certd query (9879), certd peer mesh (9878, 9876/UDP).
+  - to:
+    - podSelector: {}
+    ports:
+    - port: 9879
+      protocol: TCP
+    - port: 9878
+      protocol: TCP
+    - port: 9876
+      protocol: UDP
+  # AppViewX REST API egress (certd only exercises this, but the policy is
+  # namespace-wide to avoid pod-label drift locking it out on rename).
+  #
+  # PLACEHOLDER CIDR — replace with the /32 or /24 of your AppViewX tenant's
+  # public or VPC-peered IP before applying in production. The range below
+  # (TEST-NET-1, RFC 5737) is unroutable on purpose so this manifest fails
+  # closed until an operator substitutes the real range.
+  - to:
+    - ipBlock:
+        cidr: 192.0.2.0/24  # REPLACE with your AVX host CIDR
+    ports:
+    - port: 443
+      protocol: TCP

@@ -1,0 +1,37 @@
+# PodDisruptionBudgets (CM-31): ensure voluntary disruptions (node drains,
+# cluster upgrades, autoscaler evictions) cannot simultaneously remove every
+# replica of a certchain workload. Without a PDB the API server will happily
+# let a drain evict all replicas at once, producing a window during which no
+# certd is serving queries or no issuer is reconciling CertificateRequests
+# (CM-20). The budgets below cap concurrent voluntary disruptions so upgrades
+# degrade gracefully instead of availability-zeroing the service.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: certchain-certd
+  namespace: certchain
+spec:
+  # certd runs as a StatefulSet whose replica count varies per cluster (1 on
+  # single-node labs, 3+ in production HA). Expressing the budget as
+  # maxUnavailable: 1 scales with the replica count without manual tuning:
+  # a single replica may be rolled at a time, and on a 1-replica install the
+  # operator knowingly accepts the drain window.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: certchain
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: certchain-issuer
+  namespace: certchain
+spec:
+  # certchain-issuer runs replicas=2 with leader election. minAvailable: 1
+  # guarantees at least one replica remains to continue the CSR/CertificateRequest
+  # reconcile loop while the other is being evicted, avoiding the CM-20 stall.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: certchain-issuer

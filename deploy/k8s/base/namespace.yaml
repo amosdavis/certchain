@@ -2,3 +2,16 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: certchain
+  labels:
+    # PodSecurity admission (CM-31): enforce the "restricted" profile so any
+    # workload admitted to this namespace must run as non-root, drop all
+    # capabilities, disallow privilege escalation, and use a RuntimeDefault
+    # seccomp profile. Audit + warn are pinned to "restricted" as well so
+    # non-conforming manifests surface in the API server audit log and kubectl
+    # warnings during rollout rather than silently regressing.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

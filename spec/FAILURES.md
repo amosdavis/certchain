@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-30)
+# certchain Failure Mode Tenets (CM-01 to CM-31)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -714,3 +714,57 @@ flag-off path is exercised by inspection of `cmd/certd/main.go`: the
 `sw` variable is only constructed inside the `*enableLegacySecretWriter`
 branch, and `go vet ./...` plus `go build ./...` enforce that no
 other caller of `NewSecretWriter` exists outside that branch.
+---
+
+### CM-31 — Unconstrained Pod Privileges and Network Access Magnify Compromise Blast Radius
+
+**Risk:** A certchain pod that runs as root, with a writable root filesystem,
+with the full default set of Linux capabilities, or with unrestricted ingress
+and egress, turns any single-container compromise (supply-chain, RCE via a
+parsed PEM, a hostile CRD, a dependency CVE — CM-28) into cluster-wide
+lateral movement. Specifically: a root process can mutate `/etc/ssl`,
+write a backdoor into `/usr/local/bin`, call `mount`/`ptrace`/
+`net_admin` via retained capabilities, reach arbitrary peer pods in the
+cluster, scrape the kube-apiserver, or exfiltrate the AVX API key to any
+public IP. None of these motions are required for certd, certchain-issuer,
+or certchain-sync to do their jobs, so the default-permissive Kubernetes
+admission posture is strictly a liability.
+
+**Mitigation:**
+- The `certchain` namespace is labeled
+  `pod-security.kubernetes.io/enforce=restricted` (plus `audit` and
+  `warn`) so PodSecurity admission rejects any manifest that does not
+  satisfy the restricted profile.
+- Every Deployment and StatefulSet in `deploy/k8s/base` sets both a
+  pod-level and container-level `securityContext` with
+  `runAsNonRoot: true`, `runAsUser: 10001`, `runAsGroup: 10001`,
+  `fsGroup: 10001`, `allowPrivilegeEscalation: false`,
+  `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`, and
+  `seccompProfile.type: RuntimeDefault`. Writable paths the binaries
+  still need (`/tmp`, and `/data/certchain` for certd) are backed by
+  explicit `emptyDir: {medium: Memory}` tmpfs volumes or the certd PVC
+  — no other path on the container image is writable at runtime.
+- `deploy/k8s/base/networkpolicy.yaml` installs a namespace-wide
+  `default-deny-all` policy and then layers narrow allow-lists:
+    - certd ingress: 9879 (query) from certchain-issuer + same-namespace +
+      kube-system; 9880 (metrics) only from namespaces labeled
+      `prometheus: enabled`; 9878 (peer) from same-app peers only.
+    - certchain-issuer ingress: 9443 (webhook) from kube-system;
+      9880 (metrics) from Prometheus only.
+    - Namespace-wide egress: DNS to kube-dns, 443/6443 to kube-apiserver
+      (via kube-system selector), intra-namespace peer/query/discovery
+      ports, and a single documented `ipBlock` for the AppViewX REST
+      endpoint. The AVX CIDR is shipped as the unroutable RFC 5737
+      `192.0.2.0/24` placeholder so the manifest fails closed until an
+      operator substitutes the real range.
+- `deploy/k8s/base/pdb.yaml` caps voluntary disruptions
+  (`maxUnavailable: 1` for certd, `minAvailable: 1` for the issuer) so
+  a hardened pod set cannot be evicted all at once during a node drain —
+  the runtime invariant behind CM-20.
+
+**Test:** `go build ./...`, `go vet ./...`, and
+`go test -count=1 ./...` continue to pass because the change is
+deployment-surface-only. `kubectl apply --dry-run=client -k
+deploy/k8s/base/` structurally validates the full manifest set against the
+in-cluster schema when kubectl is available; otherwise YAML parse
+correctness is verified via `kustomize build deploy/k8s/base`.

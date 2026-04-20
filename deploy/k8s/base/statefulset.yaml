@@ -14,13 +14,34 @@ spec:
       labels:
         app: certchain
     spec:
+      # Pod-level securityContext (CM-31): unprivileged UID/GID + fsGroup so
+      # the PVC mounted below is writable to the certd process, and
+      # RuntimeDefault seccomp so the pod passes the namespace's restricted
+      # PodSecurity admission profile.
       securityContext:
-        fsGroup: 65532
         runAsNonRoot: true
-        runAsUser: 65532
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: certd
         image: your-registry/certchain:latest
+        # Container-level securityContext (CM-31): drop every capability,
+        # forbid privilege escalation, and make the root filesystem read-only.
+        # Writable paths are the /data/certchain PVC (via volumeClaimTemplates)
+        # and the /tmp tmpfs emptyDir below.
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         # All configuration is driven by env vars; see cluster-a/configmap.yaml
         # and cluster-a/secret.yaml. certd falls back to env vars when flags are
         # not set (AVX_URL, AVX_KEY, NOTIFY_URL, STATIC_PEERS).
@@ -80,12 +101,17 @@ spec:
         - name: sync
           containerPort: 9878
           protocol: TCP
+        - name: metrics
+          containerPort: 9880
+          protocol: TCP
         - name: discovery
           containerPort: 9876
           protocol: UDP
         volumeMounts:
         - name: certchain-data
           mountPath: /data/certchain
+        - name: tmp
+          mountPath: /tmp
         livenessProbe:
           httpGet:
             path: /status
@@ -105,6 +131,13 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
+      volumes:
+      # tmpfs-backed scratch space required because readOnlyRootFilesystem is
+      # true (CM-31). Keep small; real certd state lives on the PVC below.
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Mi
   volumeClaimTemplates:
   - metadata:
       name: certchain-data

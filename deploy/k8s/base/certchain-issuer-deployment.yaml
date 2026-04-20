@@ -18,13 +18,33 @@ spec:
         app: certchain-issuer
     spec:
       serviceAccountName: certchain-issuer
+      automountServiceAccountToken: true
+      # Pod-level securityContext (CM-31): run as an unprivileged, non-root
+      # UID/GID and constrain the syscall surface via RuntimeDefault seccomp.
       securityContext:
         runAsNonRoot: true
-        runAsUser: 65532
-        fsGroup: 65532
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: certchain-issuer
         image: your-registry/certchain-issuer:latest
+        # Container-level securityContext (CM-31): drop every Linux capability,
+        # forbid privilege escalation, and make the root filesystem read-only.
+        # Any writable path the process needs must be backed by an explicit
+        # emptyDir tmpfs volume below.
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          runAsGroup: 10001
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         args:
         - "--health-addr=:8081"
         - "--reconnect-delay=5s"
@@ -32,6 +52,15 @@ spec:
         - name: health
           containerPort: 8081
           protocol: TCP
+        - name: metrics
+          containerPort: 9880
+          protocol: TCP
+        - name: webhook
+          containerPort: 9443
+          protocol: TCP
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         livenessProbe:
           httpGet:
             path: /healthz
@@ -52,3 +81,11 @@ spec:
           limits:
             memory: "128Mi"
             cpu: "200m"
+      volumes:
+      # Writable scratch space required by the Go runtime / TLS cert parsing
+      # when readOnlyRootFilesystem is true (CM-31). Backed by tmpfs so the
+      # contents never touch persistent storage.
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi

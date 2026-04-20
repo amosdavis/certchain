@@ -1,0 +1,25 @@
+# Base kustomization for certchain.
+#
+# Apply with:   kubectl apply -k deploy/k8s/base/
+# Dry-run with: kubectl apply --dry-run=client -k deploy/k8s/base/
+#
+# Overlays (e.g. deploy/k8s/cluster-a) layer environment-specific ConfigMaps,
+# Secrets, and image tags on top of this base.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: certchain
+
+resources:
+- namespace.yaml
+- crds.yaml
+- rbac.yaml
+- certchain-issuer-rbac.yaml
+- service-headless.yaml
+- service-query.yaml
+- service-sync.yaml
+- statefulset.yaml
+- certchain-issuer-deployment.yaml
+- certchain-sync-deployment.yaml
+- networkpolicy.yaml
+- pdb.yaml
