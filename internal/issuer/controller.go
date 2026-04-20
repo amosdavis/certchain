@@ -20,11 +20,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/amosdavis/certchain/internal/logging"
 	"github.com/amosdavis/certchain/internal/metrics"
 
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -157,13 +160,16 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		return
 	}
 
-	// Resolve issuer to get signerName.
-	signerName, err := c.resolveSignerName(ctx, cr)
+	// Resolve issuer and patch its Ready status condition.
+	ri, err := c.resolveIssuer(ctx, cr)
 	if err != nil {
 		c.logger.Info("skip CertificateRequest: cannot resolve issuer", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("issuer_unresolved")
+		_ = c.patchIssuerStatus(ctx, ri, false, "NotReady", err.Error())
 		return
 	}
+	_ = c.patchIssuerStatus(ctx, ri, true, "Available", "certchain-issuer is reconciling CertificateRequests")
+	signerName := ri.signerName
 
 	// Extract PKCS#10 CSR DER from spec.request (base64-encoded in the CR).
 	csrB64, _, _ := unstructured.NestedString(cr.Object, "spec", "request")
@@ -194,6 +200,13 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		return
 	}
 
+	// M8: emit an auditable Event on the CertificateRequest recording that
+	// certchain-issuer auto-approved the derived K8s CSR. Deterministic name
+	// keeps reconciles idempotent.
+	if err := c.emitApprovalEvent(ctx, cr, ri.kind, ri.name); err != nil {
+		c.logger.Warn("emit approval event failed", "namespace", ns, "name", name, "err", err)
+	}
+
 	certCtx, cancel := context.WithTimeout(ctx, c.certTimeout)
 	defer cancel()
 
@@ -205,7 +218,7 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		return
 	}
 
-	if err := c.patchApproved(ctx, ns, name, certPEM); err != nil {
+	if err := c.patchApproved(ctx, ns, name, certPEM, ri.kind, ri.name); err != nil {
 		c.logger.Error("patch CertificateRequest failed", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("patch_failed")
 		return
@@ -219,39 +232,173 @@ func (c *Controller) recordOutcome(outcome string) {
 	}
 }
 
-// resolveSignerName looks up the CertchainClusterIssuer or CertchainIssuer
-// referenced by the CertificateRequest and returns its spec.signerName.
-// Returns the default signerName if the field is absent.
-func (c *Controller) resolveSignerName(ctx context.Context, cr *unstructured.Unstructured) (string, error) {
+// resolvedIssuer captures the coordinates of the CertchainClusterIssuer or
+// CertchainIssuer referenced by a CertificateRequest along with the fetched
+// object. The object and signerName are only populated on successful
+// resolution; kind/name/namespace are best-effort and may be populated even on
+// failure so callers can still patch the issuer's status.
+type resolvedIssuer struct {
+	kind       string
+	name       string
+	namespace  string // empty for cluster-scoped
+	gvr        schema.GroupVersionResource
+	obj        *unstructured.Unstructured
+	signerName string
+}
+
+// resolveIssuer looks up the CertchainClusterIssuer or CertchainIssuer
+// referenced by the CertificateRequest and returns the resolved coordinates
+// plus signerName. Returns the partially populated resolvedIssuer (with
+// kind/name set) on failure so callers can still report status.
+func (c *Controller) resolveIssuer(ctx context.Context, cr *unstructured.Unstructured) (*resolvedIssuer, error) {
 	issuerKind, _, _ := unstructured.NestedString(cr.Object, "spec", "issuerRef", "kind")
 	issuerName, _, _ := unstructured.NestedString(cr.Object, "spec", "issuerRef", "name")
 	crNamespace := cr.GetNamespace()
 
-	var issuerObj *unstructured.Unstructured
-	var err error
+	ri := &resolvedIssuer{name: issuerName}
 
 	switch issuerKind {
 	case "CertchainClusterIssuer", "":
-		issuerObj, err = c.dynClient.Resource(clusterIssuerGVR).Get(ctx, issuerName, metav1.GetOptions{})
+		ri.kind = "CertchainClusterIssuer"
+		ri.gvr = clusterIssuerGVR
 	case "CertchainIssuer":
-		issuerObj, err = c.dynClient.Resource(issuerGVR).Namespace(crNamespace).Get(ctx, issuerName, metav1.GetOptions{})
+		ri.kind = "CertchainIssuer"
+		ri.gvr = issuerGVR
+		ri.namespace = crNamespace
 	default:
-		return "", fmt.Errorf("unknown issuer kind %q", issuerKind)
-	}
-	if err != nil {
-		return "", fmt.Errorf("get issuer %s/%s: %w", issuerKind, issuerName, err)
+		ri.kind = issuerKind
+		return ri, fmt.Errorf("unknown issuer kind %q", issuerKind)
 	}
 
-	signerName, _, _ := unstructured.NestedString(issuerObj.Object, "spec", "signerName")
+	var (
+		obj *unstructured.Unstructured
+		err error
+	)
+	if ri.namespace == "" {
+		obj, err = c.dynClient.Resource(ri.gvr).Get(ctx, issuerName, metav1.GetOptions{})
+	} else {
+		obj, err = c.dynClient.Resource(ri.gvr).Namespace(ri.namespace).Get(ctx, issuerName, metav1.GetOptions{})
+	}
+	if err != nil {
+		return ri, fmt.Errorf("get issuer %s/%s: %w", ri.kind, issuerName, err)
+	}
+	ri.obj = obj
+
+	signerName, _, _ := unstructured.NestedString(obj.Object, "spec", "signerName")
 	if signerName == "" {
 		signerName = defaultSignerName
 	}
-	return signerName, nil
+	if !strings.HasPrefix(signerName, "certchain.io/") {
+		return ri, fmt.Errorf("issuer %s/%s spec.signerName %q is invalid: must start with %q",
+			ri.kind, issuerName, signerName, "certchain.io/")
+	}
+	ri.signerName = signerName
+	return ri, nil
+}
+
+// patchIssuerStatus patches the issuer's status.conditions with a single
+// Ready condition (True when ready, False otherwise). It avoids hot-looping
+// by skipping the patch when the desired condition already matches the
+// existing object. When ri is nil or has no kind/name the call is a no-op.
+func (c *Controller) patchIssuerStatus(ctx context.Context, ri *resolvedIssuer, ready bool, reason, message string) error {
+	if ri == nil || ri.name == "" || ri.gvr.Resource == "" {
+		return nil
+	}
+
+	status := "False"
+	if ready {
+		status = "True"
+	}
+
+	if ri.obj != nil {
+		conds, _, _ := unstructured.NestedSlice(ri.obj.Object, "status", "conditions")
+		for _, raw := range conds {
+			m, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if m["type"] == "Ready" && m["status"] == status && m["reason"] == reason && m["message"] == message {
+				return nil
+			}
+		}
+	}
+
+	patch := map[string]interface{}{
+		"status": map[string]interface{}{
+			"conditions": []map[string]interface{}{
+				{
+					"type":               "Ready",
+					"status":             status,
+					"reason":             reason,
+					"message":            message,
+					"lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+
+	var client dynamic.ResourceInterface = c.dynClient.Resource(ri.gvr)
+	if ri.namespace != "" {
+		client = c.dynClient.Resource(ri.gvr).Namespace(ri.namespace)
+	}
+	if _, err := client.Patch(ctx, ri.name, types.MergePatchType, data, metav1.PatchOptions{}, "status"); err != nil {
+		c.logger.Debug("patch issuer status failed", "kind", ri.kind, "name", ri.name, "err", err)
+		return err
+	}
+	return nil
+}
+
+// emitApprovalEvent records a Normal event against the CertificateRequest
+// documenting that certchain-issuer auto-approved the derived K8s CSR on
+// behalf of the referenced issuer. The event name is derived from the CR UID
+// so reconciles remain idempotent (AlreadyExists is treated as success).
+func (c *Controller) emitApprovalEvent(ctx context.Context, cr *unstructured.Unstructured, issuerKind, issuerName string) error {
+	if c.k8sClient == nil {
+		return nil
+	}
+	uid := string(cr.GetUID())
+	if uid == "" {
+		return nil
+	}
+	ns := cr.GetNamespace()
+	now := metav1.Now()
+	ev := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "certchain-approved-" + uid,
+			Namespace: ns,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			Kind:       "CertificateRequest",
+			APIVersion: "cert-manager.io/v1",
+			Namespace:  ns,
+			Name:       cr.GetName(),
+			UID:        cr.GetUID(),
+		},
+		Reason:         "CertchainApproved",
+		Message:        fmt.Sprintf("approved by %s/%s (cr=%s/%s)", issuerKind, issuerName, ns, cr.GetName()),
+		Type:           corev1.EventTypeNormal,
+		Source:         corev1.EventSource{Component: "certchain-issuer"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Count:          1,
+	}
+	_, err := c.k8sClient.CoreV1().Events(ns).Create(ctx, ev, metav1.CreateOptions{})
+	if k8serrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
 }
 
 // patchApproved sets status.certificate and the Ready/Approved conditions on
-// the CertificateRequest using a strategic merge patch.
-func (c *Controller) patchApproved(ctx context.Context, ns, name string, certPEM []byte) error {
+// the CertificateRequest using a strategic merge patch. The Approved
+// condition message records the CR coordinates and authorizing issuer for
+// audit purposes.
+func (c *Controller) patchApproved(ctx context.Context, ns, name string, certPEM []byte, issuerKind, issuerName string) error {
+	approvedMsg := fmt.Sprintf("approved by %s/%s (cr=%s/%s)", issuerKind, issuerName, ns, name)
 	patch := map[string]interface{}{
 		"status": map[string]interface{}{
 			"certificate": base64.StdEncoding.EncodeToString(certPEM),
@@ -260,7 +407,7 @@ func (c *Controller) patchApproved(ctx context.Context, ns, name string, certPEM
 					"type":               "Approved",
 					"status":             "True",
 					"reason":             "CertchainIssued",
-					"message":            "Certificate issued by certchain via AppViewX",
+					"message":            approvedMsg,
 					"lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
 				},
 				{
