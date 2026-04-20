@@ -10,6 +10,7 @@ import (
 
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type persistedChain struct {
@@ -81,14 +82,24 @@ func replayWAL(ctx context.Context, logger *slog.Logger, ch *chain.Chain, walPat
 }
 
 // SaveChain persists the chain's blocks to configDir/chain.json and
-// rotates the WAL if walPath is provided.
-func SaveChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, configDir, walPath string) error {
+// rotates the WAL if walPath is provided. Errors are logged with slog
+// and counted via saveErrorsTotal metric (CM-37). Returns the error so
+// callers can decide whether to stop or proceed.
+func SaveChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, configDir, walPath string, saveErrorsTotal prometheus.Counter) error {
 	data, err := json.Marshal(persistedChain{Blocks: ch.GetBlocks()})
 	if err != nil {
+		if saveErrorsTotal != nil {
+			saveErrorsTotal.Inc()
+		}
+		logger.Error("chain save: marshal failed", "error", err)
 		return err
 	}
 	path := filepath.Join(configDir, "chain.json")
 	if err := os.WriteFile(path, data, 0600); err != nil {
+		if saveErrorsTotal != nil {
+			saveErrorsTotal.Inc()
+		}
+		logger.Error("chain save: write snapshot failed", "path", path, "error", err)
 		return err
 	}
 
@@ -96,10 +107,18 @@ func SaveChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, config
 	if walPath != "" {
 		wal, err := chain.OpenWAL(walPath, logger, false)
 		if err != nil {
+			if saveErrorsTotal != nil {
+				saveErrorsTotal.Inc()
+			}
+			logger.Error("chain save: open WAL for rotate failed", "path", walPath, "error", err)
 			return fmt.Errorf("open WAL for rotate: %w", err)
 		}
 		defer wal.Close()
 		if err := wal.Rotate(); err != nil {
+			if saveErrorsTotal != nil {
+				saveErrorsTotal.Inc()
+			}
+			logger.Error("chain save: WAL rotate failed", "path", walPath, "error", err)
 			return fmt.Errorf("rotate WAL: %w", err)
 		}
 	}

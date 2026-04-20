@@ -40,6 +40,7 @@ type ChainMetrics struct {
 	BlocksAppendedTotal prometheus.Counter
 	ChainReplacedTotal  prometheus.Counter
 	ValidationFailTotal *prometheus.CounterVec
+	SaveErrorsTotal     *prometheus.CounterVec
 }
 
 // NewChainMetrics registers and returns chain metrics.
@@ -69,8 +70,14 @@ func NewChainMetrics(r *Registry) *ChainMetrics {
 			Name:      "validation_fail_total",
 			Help:      "Number of block validation failures, by reason.",
 		}, []string{"reason"}),
+		SaveErrorsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "certchain",
+			Subsystem: "chain",
+			Name:      "save_errors_total",
+			Help:      "Number of chain save/snapshot failures (CM-37), by operation.",
+		}, []string{"op"}),
 	}
-	r.MustRegister(m.BlockHeight, m.BlocksAppendedTotal, m.ChainReplacedTotal, m.ValidationFailTotal)
+	r.MustRegister(m.BlockHeight, m.BlocksAppendedTotal, m.ChainReplacedTotal, m.ValidationFailTotal, m.SaveErrorsTotal)
 	return m
 }
 

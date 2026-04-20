@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-36)
+# certchain Failure Mode Tenets (CM-01 to CM-37)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -1001,4 +1001,36 @@ already observed as confirmed (violates durability).
 **Test:** TestWAL_AppendReplay, TestWAL_TruncatedTail, TestWAL_CRCMismatch,
 TestWAL_Rotate in internal/chain/wal_test.go verify record framing, replay
 correctness, and tail-truncation handling.
+
+---
+
+### CM-37 — Silently Swallowed Snapshot Errors Cause Stale Persisted Chain and Data Loss on Crash
+
+**Risk:** SaveChain persists the in-memory chain to disk (chain.json snapshot +
+WAL rotation). If the write fails due to transient I/O errors (disk full, NFS
+timeout, read-only filesystem) and the error is silently swallowed, the
+persisted chain diverges from the in-memory state. On crash or restart, the
+process reverts to the last successful snapshot, losing all blocks committed
+since then. Clients see confirmed transactions disappear (durability violation).
+Combined with CM-36, the WAL protects against mid-write corruption but only if
+SaveChain successfully completes; dropped errors mean the WAL never rotates and
+the snapshot remains stale.
+
+**Mitigation:**
+- SaveChain logs every failure with slog.Error at ERROR level, including full
+  context (file path, operation, underlying error).
+- A Prometheus counter certchain_chain_save_errors_total{op="snapshot"} is
+  incremented on every save failure (snapshot write or WAL rotate).
+- Errors are NOT treated as fatal; certd continues running because the WAL
+  still provides crash safety for the current session. However, operators must
+  monitor the metric and investigate repeated failures before disk fills or the
+  process restarts.
+- WAL append failures (during Submit/BatchSubmit) remain fatal to the commit
+  operation and are NOT counted by this metric; the caller receives the error
+  and the transaction is not applied.
+
+**Test:** TestSaveChainErrorMetric and TestSaveChainWALRotateError in
+internal/certd/chain_test.go verify that the metric is incremented when writes
+fail (non-existent directory, read-only file, missing WAL path) and NOT
+incremented on successful writes.
 

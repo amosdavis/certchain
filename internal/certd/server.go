@@ -55,7 +55,7 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	// Admin metrics listener. Safe to start early — it has no dependencies.
 	registry := metrics.NewRegistry()
-	_ = metrics.NewChainMetrics(registry)
+	chainMetrics := metrics.NewChainMetrics(registry)
 	_ = metrics.NewAVXMetrics(registry)
 	// Readiness state (CM-27). certd has no leader election today so the
 	// leader signal is reported as "disabled" and does not gate readiness.
@@ -130,7 +130,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	// blockSubmitter batches all block submissions (avxPollLoop + CSRWatcher)
 	// through chain.Batcher so bursts commit as a single multi-tx block and
 	// the per-node nonce stays monotonically increasing (CM-32).
-	bs := NewBlockSubmitter(ctx, logger, ch, certStore, id, syncer, cfg.ConfigDir, walPath, cfg.BatchMaxTxs, cfg.BatchMaxWait)
+	bs := NewBlockSubmitter(ctx, logger, ch, certStore, id, syncer, cfg.ConfigDir, walPath, cfg.BatchMaxTxs, cfg.BatchMaxWait, chainMetrics.SaveErrorsTotal.WithLabelValues("snapshot"))
 	defer bs.Stop()
 
 	// AppViewX client — shared between poll loop and K8s CSR watcher.
@@ -224,9 +224,7 @@ func Run(ctx context.Context, cfg *Config) error {
 			if err := certStore.RebuildFrom(ch.GetBlocks()); err != nil {
 				log.Printf("certd: cert store rebuild: %v", err)
 			}
-			if err := SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath); err != nil {
-				log.Printf("certd: save chain: %v", err)
-			}
+			_ = SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath, chainMetrics.SaveErrorsTotal.WithLabelValues("snapshot"))
 			triggerK8sSync()
 		}
 	}
@@ -277,9 +275,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	<-ctx.Done()
 	log.Println("certd: shutting down")
 
-	if err := SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath); err != nil {
-		log.Printf("certd: save chain on shutdown: %v", err)
-	}
+	_ = SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath, chainMetrics.SaveErrorsTotal.WithLabelValues("snapshot"))
 
 	return nil
 }

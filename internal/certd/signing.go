@@ -22,6 +22,7 @@ import (
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
 	"github.com/amosdavis/certchain/internal/peer"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // BlockSubmitter groups block submissions from concurrent goroutines
@@ -30,29 +31,31 @@ import (
 // single-threaded, so SignTx assigns the per-node nonce without a mutex;
 // per-batch rollback on a failed commit keeps the counter monotonic.
 type BlockSubmitter struct {
-	nonce     uint32
-	ch        *chain.Chain
-	id        *crypto.Identity
-	certStore *cert.Store
-	syncer    *peer.Syncer
-	configDir string
-	walPath   string
-	batcher   *chain.Batcher
-	logger    *slog.Logger
+	nonce           uint32
+	ch              *chain.Chain
+	id              *crypto.Identity
+	certStore       *cert.Store
+	syncer          *peer.Syncer
+	configDir       string
+	walPath         string
+	batcher         *chain.Batcher
+	logger          *slog.Logger
+	saveErrorsTotal prometheus.Counter
 }
 
 // NewBlockSubmitter creates a BlockSubmitter that batches transactions
 // through a chain.Batcher. It resumes the nonce from the chain to avoid
 // replay.
-func NewBlockSubmitter(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir, walPath string, batchMaxTxs int, batchMaxWait time.Duration) *BlockSubmitter {
+func NewBlockSubmitter(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir, walPath string, batchMaxTxs int, batchMaxWait time.Duration, saveErrorsTotal prometheus.Counter) *BlockSubmitter {
 	bs := &BlockSubmitter{
-		ch:        ch,
-		certStore: certStore,
-		id:        id,
-		syncer:    syncer,
-		configDir: configDir,
-		walPath:   walPath,
-		logger:    logger,
+		ch:              ch,
+		certStore:       certStore,
+		id:              id,
+		syncer:          syncer,
+		configDir:       configDir,
+		walPath:         walPath,
+		logger:          logger,
+		saveErrorsTotal: saveErrorsTotal,
 	}
 	// Resume nonce from chain to avoid replay (monotonic per-node).
 	for _, blk := range ch.GetBlocks() {
@@ -99,7 +102,7 @@ func (bs *BlockSubmitter) onBlockCommitted(blk chain.Block) {
 		log.Printf("certd: cert store apply block: %v", err)
 	}
 	bs.syncer.PushBlockToPeers(blk)
-	_ = SaveChain(context.Background(), bs.logger, bs.ch, bs.configDir, bs.walPath)
+	_ = SaveChain(context.Background(), bs.logger, bs.ch, bs.configDir, bs.walPath, bs.saveErrorsTotal)
 }
 
 // Submit adds a transaction to the chain via the Batcher. tx must have
