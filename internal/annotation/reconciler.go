@@ -21,6 +21,10 @@ import (
 
 	"github.com/amosdavis/certchain/internal/logging"
 	"github.com/amosdavis/certchain/internal/metrics"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -204,7 +208,18 @@ func serviceRef(s *corev1.Service) ObjectRef {
 //   - err: a non-recoverable error the caller should log; the reconcile
 //     loop should retry after a backoff. err also increments the
 //     errors_total metric.
+//
+// CM-38: instrumented with tracing span.
 func (r *Reconciler) Reconcile(ctx context.Context, ref ObjectRef) error {
+	tracer := otel.Tracer("annotation-ctrl")
+	ctx, span := tracer.Start(ctx, "Reconciler.Reconcile",
+		trace.WithAttributes(
+			attribute.String("object.namespace", ref.Namespace),
+			attribute.String("object.name", ref.Name),
+			attribute.String("object.kind", ref.Kind),
+		))
+	defer span.End()
+	
 	r.reconciles.Add(1)
 	if r.metrics != nil {
 		r.metrics.Reconciles.Inc()
@@ -212,26 +227,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, ref ObjectRef) error {
 
 	cn := strings.TrimSpace(ref.Annotations[AnnotationCertCN])
 	if cn == "" {
-		// Annotation absent or removed. Make sure no Secret this
-		// controller previously created for this object is left
-		// behind. This is the sweep-on-revoke analogue for the
-		// annotation path (scoped strictly to our managed-by label so
-		// we can never touch a certd- or cert-manager-owned Secret;
-		// CM-30).
 		return r.sweepOrphans(ctx, ref)
 	}
+	span.SetAttributes(attribute.String("cert.cn", cn))
 
 	bundle, err := r.fetcher.Fetch(ctx, cn)
 	if err != nil {
 		if errors.Is(err, ErrCertNotFound) {
-			// Not an error: the cert has not been issued yet.
-			// Emit an Event so operators can see the wait state,
-			// but do not count it against errors_total.
 			r.emitEvent(ctx, ref, corev1.EventTypeNormal, EventReasonIssued,
 				fmt.Sprintf("waiting for certd to issue cert for CN=%s", cn))
 			return nil
 		}
 		r.recordError(ctx, ref, err)
+		span.RecordError(err)
 		return fmt.Errorf("fetch cert for CN %q: %w", cn, err)
 	}
 
@@ -240,11 +248,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, ref ObjectRef) error {
 		secretName = DefaultSecretName(cn)
 	}
 
+	// CM-38: Span for Secret upsert.
+	_, upsertSpan := tracer.Start(ctx, "Secret.Upsert",
+		trace.WithAttributes(attribute.String("secret.name", secretName)))
 	action, err := r.upsertSecret(ctx, ref, secretName, cn, bundle)
 	if err != nil {
 		r.recordError(ctx, ref, err)
+		upsertSpan.RecordError(err)
+		upsertSpan.End()
 		return fmt.Errorf("upsert secret %s/%s: %w", ref.Namespace, secretName, err)
 	}
+	upsertSpan.End()
 
 	switch action {
 	case actionCreated:
@@ -258,11 +272,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, ref ObjectRef) error {
 	if r.metrics != nil {
 		r.metrics.LastSuccessSeconds.Set(float64(r.now().Unix()))
 	}
-	// Fire-and-forget: the renewal scheduler hook. Never fail reconcile
-	// on notifier errors (see RenewalNotifier doc).
+	// CM-38: Span for renewal notification.
+	_, renewSpan := tracer.Start(ctx, "Renewal.Notify")
 	if err := r.notifier.OnNearExpiry(ctx, cn); err != nil {
 		r.logger.Warn("renewal notifier returned error", "cn", cn, "err", err)
+		renewSpan.RecordError(err)
 	}
+	renewSpan.End()
+	
 	return nil
 }
 

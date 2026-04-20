@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-37)
+# certchain Failure Mode Tenets (CM-01 to CM-38)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -1033,4 +1033,42 @@ the snapshot remains stale.
 internal/certd/chain_test.go verify that the metric is incremented when writes
 fail (non-existent directory, read-only file, missing WAL path) and NOT
 incremented on successful writes.
+
+---
+
+### CM-38 — No Distributed Tracing Means Cross-Service Cert-Issuance Latency and Failures Are Hard to Attribute
+
+**Risk:** Certificate issuance spans three services: annotation-ctrl or
+certchain-issuer submits a CSR to certd, certd signs it via AppViewX, and the
+client fetches the signed cert. When issuance fails or is slow, operators have
+no unified view of where the delay/error occurred: was it the Kubernetes API,
+certd query API, AppViewX HTTP call, or a WAL write? Each service logs
+separately, forcing operators to grep across multiple streams and correlate
+manually by timestamp + CN, which is error-prone and slow during incidents.
+
+**Mitigation:**
+- All three binaries (certd, certchain-issuer, annotation-ctrl) initialize
+  OpenTelemetry tracing via internal/tracing.Init.
+- Each binary accepts --otel-endpoint flag and OTEL_EXPORTER_OTLP_ENDPOINT env
+  var. When empty, tracing is no-op so local dev and tests do not require a
+  collector.
+- OTLP/HTTP exporter is used for portability across collector deployments;
+  production should configure HTTPS via OTEL_EXPORTER_OTLP_CERTIFICATE or
+  equivalent env vars.
+- W3C tracecontext propagation is configured as the default propagator so
+  incoming HTTP requests to certd's Bearer-protected query API propagate trace
+  context to downstream certd operations (Submit, WAL.Append, peer push).
+- Key spans:
+  - certd: HTTP middleware on query API (otelhttp), BlockSubmitter.Submit,
+    WAL.Append, peer.PushBlockToPeers.
+  - certchain-issuer: Controller.reconcile, CreateCSR, ApproveCSR, PatchApproved.
+  - annotation-ctrl: Reconciler.Reconcile, Secret.Upsert, Renewal.Notify.
+- Context propagation ensures that a single trace ID links the entire issuance
+  flow from CertificateRequest create event through to Secret update.
+
+**Test:** internal/tracing/tracing_test.go validates Init returns a shutdown
+function and configures no-op mode when endpoint is empty. Higher-level trace
+integration is verified manually via local collector + Jaeger UI or CI
+integration tests that assert span presence in sdktrace.InMemoryExporter.
+
 

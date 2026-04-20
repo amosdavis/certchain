@@ -23,6 +23,9 @@ import (
 	"github.com/amosdavis/certchain/internal/crypto"
 	"github.com/amosdavis/certchain/internal/peer"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // BlockSubmitter groups block submissions from concurrent goroutines
@@ -96,12 +99,27 @@ func (bs *BlockSubmitter) OnBatchRollback(n int) {
 
 // onBlockCommitted is the Batcher's post-commit hook. It mirrors the
 // pre-CM-32 per-block side-effects: cert-store apply, peer push, and
-// persistent save.
+// persistent save. CM-38: instrumented with tracing spans.
 func (bs *BlockSubmitter) onBlockCommitted(blk chain.Block) {
+	tracer := otel.Tracer("certd")
+	_, span := tracer.Start(context.Background(), "BlockSubmitter.onBlockCommitted",
+		trace.WithAttributes(
+			attribute.Int("block.index", int(blk.Index)),
+			attribute.Int("block.tx_count", len(blk.Txs)),
+		))
+	defer span.End()
+	
 	if err := bs.certStore.ApplyBlock(blk); err != nil {
 		log.Printf("certd: cert store apply block: %v", err)
+		span.RecordError(err)
 	}
+	
+	// CM-38: Span for peer push operation.
+	_, pushSpan := tracer.Start(context.Background(), "peer.PushBlockToPeers",
+		trace.WithAttributes(attribute.Int("block.index", int(blk.Index))))
 	bs.syncer.PushBlockToPeers(blk)
+	pushSpan.End()
+	
 	_ = SaveChain(context.Background(), bs.logger, bs.ch, bs.configDir, bs.walPath, bs.saveErrorsTotal)
 }
 
@@ -110,8 +128,21 @@ func (bs *BlockSubmitter) onBlockCommitted(blk chain.Block) {
 // filled in by SignTx inside the drain goroutine, preventing duplicate
 // nonces when multiple goroutines submit concurrently. Submit blocks
 // until the batch containing tx has been committed (or rejected).
+// CM-38: instrumented with tracing span.
 func (bs *BlockSubmitter) Submit(tx chain.Transaction) error {
-	return bs.batcher.Submit(tx)
+	tracer := otel.Tracer("certd")
+	ctx, span := tracer.Start(context.Background(), "BlockSubmitter.Submit",
+		trace.WithAttributes(
+			attribute.String("tx.type", fmt.Sprintf("%d", tx.Type)),
+		))
+	defer span.End()
+	
+	err := bs.batcher.Submit(tx)
+	if err != nil {
+		span.RecordError(err)
+	}
+	_ = ctx
+	return err
 }
 
 // Stop flushes any queued txs and releases the Batcher drain goroutine.

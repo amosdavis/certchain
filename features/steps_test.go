@@ -34,6 +34,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/amosdavis/certchain/internal/annotation"
 	"github.com/amosdavis/certchain/internal/avx"
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
@@ -82,6 +83,16 @@ type world struct {
 	createdK8sCSRName  string          // name of K8s CSR created by the issuer
 	clusterIssuers     map[string]*unstructured.Unstructured // mock CertchainClusterIssuer objects
 	certRequests       map[string]*unstructured.Unstructured // mock CertificateRequest objects
+
+	// annotation-ctrl state
+	annotationReconciler       *annotation.Reconciler
+	annotationScheduler        *annotation.RenewalScheduler
+	annotationFetcher          *stubCertFetcher
+	annotationLastPodRef       annotation.ObjectRef
+	annotationLastServiceRef   annotation.ObjectRef
+	annotationLastReconcileErr error
+	annotationRenewBefore      time.Duration
+	annotationK8sEvents        []*corev1.Event
 }
 
 type pendingCertSpec struct {
@@ -1798,6 +1809,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the CertificateRequest status\.certificate is set$`, w.theCertificateRequestStatusCertificateIsSet)
 	ctx.Step(`^the CertificateRequest status\.certificate is not set$`, w.theCertificateRequestStatusCertificateIsNotSet)
 	ctx.Step(`^the CertificateRequest has condition "([^"]+)" with status "([^"]+)"$`, w.theCertificateRequestHasConditionWithStatus)
+
+	// annotation-ctrl steps
+	registerAnnotationSteps(ctx, w)
 }
 
 func TestBDD(t *testing.T) {

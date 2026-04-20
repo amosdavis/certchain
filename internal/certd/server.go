@@ -20,6 +20,9 @@ import (
 	"github.com/amosdavis/certchain/internal/metrics"
 	"github.com/amosdavis/certchain/internal/peer"
 	"github.com/amosdavis/certchain/internal/query"
+	"github.com/amosdavis/certchain/internal/tracing"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // Run is the main entry point for certd. It sets up all subsystems and
@@ -27,6 +30,19 @@ import (
 // a default text logger writing to stderr is created.
 func Run(ctx context.Context, cfg *Config) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	// CM-38: Initialize OpenTelemetry tracing.
+	shutdownTracing, err := tracing.Init(ctx, "certd", cfg.OTelEndpoint)
+	if err != nil {
+		return fmt.Errorf("init tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Printf("certd: tracing shutdown: %v", err)
+		}
+	}()
 
 	// CM-28: resolve peer-push HMAC secret and query-API bearer token.
 	// File-based sources take precedence over flag values to keep secrets
@@ -236,9 +252,16 @@ func Run(ctx context.Context, cfg *Config) error {
 	// HTTP query API.
 	qserver := query.NewServer(certStore, ch, peerTable, cfg.ConfigDir)
 	qserver.SetDERFetcher(syncer)
+	
+	// CM-38: Wrap handler with otelhttp middleware for distributed tracing.
+	handler := otelhttp.NewHandler(
+		queryAuthMiddleware(qserver.Handler(), queryTokenBytes),
+		"certd-query-api",
+	)
+	
 	httpServer := &http.Server{
 		Addr:         cfg.QueryAddr,
-		Handler:      queryAuthMiddleware(qserver.Handler(), queryTokenBytes),
+		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,

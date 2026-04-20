@@ -33,6 +33,7 @@ import (
 	"github.com/amosdavis/certchain/internal/leader"
 	"github.com/amosdavis/certchain/internal/logging"
 	"github.com/amosdavis/certchain/internal/metrics"
+	"github.com/amosdavis/certchain/internal/tracing"
 )
 
 func main() {
@@ -52,12 +53,27 @@ func main() {
 	readinessMaxStaleness := flag.Duration("readiness-max-staleness", 60*time.Second, "Maximum age of the last certd probe before /readyz returns 503 (CM-27)")
 	certdProbeInterval := flag.Duration("certd-probe-interval", 15*time.Second, "Background certd reachability probe interval for /readyz (CM-27)")
 	renewBefore := flag.Duration("renew-before", 30*24*time.Hour, "Renew certs this duration before NotAfter (default 30d)")
+	otelEndpoint := flag.String("otel-endpoint", "", "OTLP/HTTP endpoint for distributed tracing (empty=no-op); overridden by OTEL_EXPORTER_OTLP_ENDPOINT (CM-38)")
 	flag.Parse()
 
 	logger := logging.New(logging.Options{
 		Format: logging.ParseFormat(*logFormat),
 		Level:  logging.ParseLevel(*logLevel),
 	}).With("binary", "annotation-ctrl")
+
+	// CM-38: Initialize OpenTelemetry tracing.
+	shutdownTracing, err := tracing.Init(context.Background(), "annotation-ctrl", *otelEndpoint)
+	if err != nil {
+		logger.Error("init tracing", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			logger.Warn("tracing shutdown", "err", err)
+		}
+	}()
 
 	token, err := resolveToken(*queryTokenFile, *queryToken, "CERTD_QUERY_TOKEN")
 	if err != nil {

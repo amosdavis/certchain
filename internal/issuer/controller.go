@@ -40,6 +40,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -396,7 +400,17 @@ func (c *Controller) emitGiveUpEvent(ctx context.Context, key string, cause erro
 // or a no-op skip; returns an error to signal a retry-worthy transient
 // failure. Status patching for terminal outcomes (Failed condition) happens
 // inline before the nil return so that a single success does not re-queue.
+// CM-38: instrumented with tracing span.
 func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructured) error {
+	tracer := otel.Tracer("certchain-issuer")
+	ctx, span := tracer.Start(ctx, "Controller.reconcile",
+		trace.WithAttributes(
+			attribute.String("cr.namespace", cr.GetNamespace()),
+			attribute.String("cr.name", cr.GetName()),
+			attribute.String("cr.uid", string(cr.GetUID())),
+		))
+	defer span.End()
+	
 	name := cr.GetName()
 	ns := cr.GetNamespace()
 	uid := string(cr.GetUID())
@@ -424,8 +438,7 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		c.logger.Info("skip CertificateRequest: cannot resolve issuer", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("issuer_unresolved")
 		_ = c.patchIssuerStatus(ctx, ri, false, "NotReady", err.Error())
-		// Unresolved issuer is terminal for this reconcile pass; the
-		// workqueue will revisit on the next CR event.
+		span.RecordError(err)
 		return nil
 	}
 	_ = c.patchIssuerStatus(ctx, ri, true, "Available", "certchain-issuer is reconciling CertificateRequests")
@@ -441,6 +454,7 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 			c.logger.Error("CR spec.request is not valid base64", "namespace", ns, "name", name, "err", err)
 			c.recordOutcome("invalid_csr_encoding")
 			_ = c.patchFailed(ctx, ns, name, "spec.request is not valid base64")
+			span.RecordError(err)
 			return nil
 		}
 	}
@@ -448,17 +462,29 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 	// K8s CSR name derived from CR UID so it is globally unique and idempotent.
 	csrName := "certchain-" + uid
 
+	// CM-38: Span for CSR creation.
+	_, csrSpan := tracer.Start(ctx, "CreateCSR",
+		trace.WithAttributes(attribute.String("csr.name", csrName)))
 	if err := CreateCSR(ctx, c.k8sClient, csrName, signerName, csrDER); err != nil {
 		c.logger.Error("create K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("create_csr_failed")
+		csrSpan.RecordError(err)
+		csrSpan.End()
 		return fmt.Errorf("create K8s CSR %s: %w", csrName, err)
 	}
+	csrSpan.End()
 
+	// CM-38: Span for CSR approval.
+	_, approveSpan := tracer.Start(ctx, "ApproveCSR",
+		trace.WithAttributes(attribute.String("csr.name", csrName)))
 	if err := ApproveCSR(ctx, c.k8sClient, csrName); err != nil {
 		c.logger.Error("approve K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("approve_csr_failed")
+		approveSpan.RecordError(err)
+		approveSpan.End()
 		return fmt.Errorf("approve K8s CSR %s: %w", csrName, err)
 	}
+	approveSpan.End()
 
 	// M8: emit an auditable Event on the CertificateRequest recording that
 	// certchain-issuer auto-approved the derived K8s CSR. Deterministic name
@@ -475,14 +501,21 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		c.logger.Error("wait for cert failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
 		c.recordOutcome("wait_cert_failed")
 		_ = c.patchFailed(ctx, ns, name, err.Error())
+		span.RecordError(err)
 		return nil
 	}
 
+	// CM-38: Span for status patch.
+	_, patchSpan := tracer.Start(ctx, "PatchApproved")
 	if err := c.patchApproved(ctx, ns, name, certPEM, ri.kind, ri.name); err != nil {
 		c.logger.Error("patch CertificateRequest failed", "namespace", ns, "name", name, "err", err)
 		c.recordOutcome("patch_failed")
+		patchSpan.RecordError(err)
+		patchSpan.End()
 		return fmt.Errorf("patch CR %s/%s: %w", ns, name, err)
 	}
+	patchSpan.End()
+	
 	c.recordOutcome("issued")
 	return nil
 }

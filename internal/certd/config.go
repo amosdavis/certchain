@@ -34,6 +34,7 @@ type Config struct {
 	BatchMaxTxs              int
 	BatchMaxWait             time.Duration
 	ChainWALPath             string
+	OTelEndpoint             string
 }
 
 // ParseFlags parses command-line flags and environment variables
@@ -79,6 +80,9 @@ func ParseFlags(args []string) *Config {
 
 	// CM-36: write-ahead log
 	fs.StringVar(&cfg.ChainWALPath, "chain-wal-path", "", "path to chain WAL file (default: <config-dir>/chain.wal)")
+
+	// CM-38: OpenTelemetry tracing
+	fs.StringVar(&cfg.OTelEndpoint, "otel-endpoint", "", "OTLP/HTTP endpoint for distributed tracing (empty=no-op); overridden by OTEL_EXPORTER_OTLP_ENDPOINT (CM-38)")
 
 	_ = fs.Parse(args)
 

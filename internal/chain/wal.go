@@ -7,6 +7,7 @@
 package chain
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,10 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -55,17 +60,29 @@ func OpenWAL(path string, logger *slog.Logger, fsync bool) (*WAL, error) {
 
 // Append writes a block to the WAL. Returns an error if the write or fsync
 // fails, in which case the caller must treat the block as not durably committed.
+// CM-38: instrumented with tracing span.
 func (w *WAL) Append(b *Block) error {
+	tracer := otel.Tracer("certd")
+	ctx := context.Background()
+	_, span := tracer.Start(ctx, "WAL.Append",
+		trace.WithAttributes(
+			attribute.Int("block.index", int(b.Index)),
+			attribute.Bool("fsync", w.fsync),
+		))
+	defer span.End()
+	
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if w.closed {
+		span.RecordError(ErrWALClosed)
 		return ErrWALClosed
 	}
 
 	rec := walRecord{Block: *b}
 	payload, err := json.Marshal(&rec)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("wal.Append: marshal: %w", err)
 	}
 
@@ -76,14 +93,17 @@ func (w *WAL) Append(b *Block) error {
 	binary.LittleEndian.PutUint32(hdr[4:8], crc)
 
 	if _, err := w.file.Write(hdr[:]); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("wal.Append: write header: %w", err)
 	}
 	if _, err := w.file.Write(payload); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("wal.Append: write payload: %w", err)
 	}
 
 	if w.fsync {
 		if err := w.file.Sync(); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("wal.Append: sync: %w", err)
 		}
 	}
