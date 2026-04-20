@@ -19,8 +19,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
+
+	"github.com/amosdavis/certchain/internal/logging"
+	"github.com/amosdavis/certchain/internal/metrics"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -61,6 +64,8 @@ type Controller struct {
 	k8sClient    kubernetes.Interface
 	pollInterval time.Duration
 	certTimeout  time.Duration
+	logger       *slog.Logger
+	metrics      *metrics.IssuerMetrics
 }
 
 // NewController creates a Controller.
@@ -70,7 +75,22 @@ func NewController(dynClient dynamic.Interface, k8sClient kubernetes.Interface) 
 		k8sClient:    k8sClient,
 		pollInterval: defaultPollInterval,
 		certTimeout:  defaultCertWaitTimeout,
+		logger:       logging.Discard(),
 	}
+}
+
+// WithLogger sets the logger. Must be called before Run.
+func (c *Controller) WithLogger(l *slog.Logger) *Controller {
+	if l != nil {
+		c.logger = l.With("component", "issuer")
+	}
+	return c
+}
+
+// WithMetrics sets the metrics collector.
+func (c *Controller) WithMetrics(m *metrics.IssuerMetrics) *Controller {
+	c.metrics = m
+	return c
 }
 
 // WithPollInterval overrides the K8s CSR status poll interval. Used in tests.
@@ -140,7 +160,8 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 	// Resolve issuer to get signerName.
 	signerName, err := c.resolveSignerName(ctx, cr)
 	if err != nil {
-		log.Printf("certchain-issuer: skip CR %s/%s — cannot resolve issuer: %v", ns, name, err)
+		c.logger.Info("skip CertificateRequest: cannot resolve issuer", "namespace", ns, "name", name, "err", err)
+		c.recordOutcome("issuer_unresolved")
 		return
 	}
 
@@ -151,7 +172,8 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 		// cert-manager base64-encodes the field; try URL encoding as fallback.
 		csrDER, err = base64.URLEncoding.DecodeString(csrB64)
 		if err != nil {
-			log.Printf("certchain-issuer: CR %s/%s spec.request is not valid base64: %v", ns, name, err)
+			c.logger.Error("CR spec.request is not valid base64", "namespace", ns, "name", name, "err", err)
+			c.recordOutcome("invalid_csr_encoding")
 			_ = c.patchFailed(ctx, ns, name, "spec.request is not valid base64")
 			return
 		}
@@ -161,12 +183,14 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 	csrName := "certchain-" + uid
 
 	if err := CreateCSR(ctx, c.k8sClient, csrName, signerName, csrDER); err != nil {
-		log.Printf("certchain-issuer: create K8s CSR for CR %s/%s: %v", ns, name, err)
+		c.logger.Error("create K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
+		c.recordOutcome("create_csr_failed")
 		return
 	}
 
 	if err := ApproveCSR(ctx, c.k8sClient, csrName); err != nil {
-		log.Printf("certchain-issuer: approve K8s CSR %s for CR %s/%s: %v", csrName, ns, name, err)
+		c.logger.Error("approve K8s CSR failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
+		c.recordOutcome("approve_csr_failed")
 		return
 	}
 
@@ -175,13 +199,23 @@ func (c *Controller) reconcile(ctx context.Context, cr *unstructured.Unstructure
 
 	certPEM, err := WaitForCert(certCtx, c.k8sClient, csrName, c.pollInterval)
 	if err != nil {
-		log.Printf("certchain-issuer: wait for cert for CR %s/%s: %v", ns, name, err)
+		c.logger.Error("wait for cert failed", "namespace", ns, "name", name, "csr", csrName, "err", err)
+		c.recordOutcome("wait_cert_failed")
 		_ = c.patchFailed(ctx, ns, name, err.Error())
 		return
 	}
 
 	if err := c.patchApproved(ctx, ns, name, certPEM); err != nil {
-		log.Printf("certchain-issuer: patch CertificateRequest %s/%s with cert: %v", ns, name, err)
+		c.logger.Error("patch CertificateRequest failed", "namespace", ns, "name", name, "err", err)
+		c.recordOutcome("patch_failed")
+		return
+	}
+	c.recordOutcome("issued")
+}
+
+func (c *Controller) recordOutcome(outcome string) {
+	if c.metrics != nil {
+		c.metrics.RequestsTotal.WithLabelValues(outcome).Inc()
 	}
 }
 

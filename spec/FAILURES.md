@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-15)
+# certchain Failure Mode Tenets (CM-01 to CM-22)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -364,3 +364,32 @@ cert.
   Secret.
 
 **Test:** `TestCertificateRenewalRaceExpiry` in `features/cert_certmanager_issuer.feature`.
+
+---
+
+## Category: High-Availability Coordination
+
+### CM-22 — Split-Brain Reconciliation Across Replicas
+
+**Risk:** Two or more replicas of certchain-issuer (or certd's block submitter) run
+simultaneously without coordination. They may concurrently create duplicate
+Kubernetes CSR objects, submit duplicate AVX requests, or produce blocks with
+conflicting nonces, leading to chain rejection, duplicate cert issuance, and
+operator confusion.
+
+**Mitigation:**
+- Both binaries take a `coordination.k8s.io/v1 Lease` via the shared
+  `internal/leader` helper. Only the leader runs singleton workloads
+  (CR reconciliation, CSR watch, block submission). Followers block until
+  they acquire the lease.
+- `leader-elect` is **on by default** in both binaries. Operators who
+  explicitly opt out (single-replica development) receive a WARN log.
+- The leader lease has `ReleaseOnCancel: true` so shutdown is immediate.
+- `RenewDeadline` is strictly less than `LeaseDuration`; the helper rejects
+  misconfiguration at startup.
+- When a replica loses leadership its workload context is cancelled,
+  preventing any continued writes after another replica becomes leader.
+
+**Test:** `TestRunExecutesLeaderFunction` in `internal/leader/leader_test.go`;
+  integration test will be added with Phase 3 (H5) when the issuer workqueue
+  is wired in.

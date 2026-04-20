@@ -35,6 +35,7 @@ import (
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
 	certk8s "github.com/amosdavis/certchain/internal/k8s"
+	"github.com/amosdavis/certchain/internal/metrics"
 	"github.com/amosdavis/certchain/internal/peer"
 	"github.com/amosdavis/certchain/internal/query"
 )
@@ -59,6 +60,7 @@ func main() {
 	k8sNamespace    := flag.String("k8s-namespace", "", "Kubernetes namespace for Secrets (default: certchain)")
 	k8sSecretPrefix := flag.String("k8s-secret-prefix", "", "prefix for K8s Secret names (default: cc)")
 	k8sSignerName   := flag.String("k8s-signer-name", "", "CSR signerName to watch (default: certchain.io/appviewx)")
+	metricsAddr     := flag.String("metrics-addr", ":9880", "Address for Prometheus /metrics (H3)")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -84,6 +86,12 @@ func main() {
 		log.Fatalf("certd: load identity: %v", err)
 	}
 	log.Printf("certd: node pubkey %s", id.PubKeyHex())
+
+	// Admin metrics listener. Safe to start early — it has no dependencies.
+	registry := metrics.NewRegistry()
+	_ = metrics.NewChainMetrics(registry)
+	_ = metrics.NewAVXMetrics(registry)
+	startCertdMetricsServer(*metricsAddr, registry)
 
 	ch := chain.New()
 	certStore := cert.NewStore(*maxCerts)
@@ -239,6 +247,24 @@ func main() {
 	if err := saveChain(ch, *configDir); err != nil {
 		log.Printf("certd: save chain on shutdown: %v", err)
 	}
+}
+
+// startCertdMetricsServer exposes /metrics on the admin port. Failures are
+// logged but do not terminate the process; metrics are observability, not
+// availability-critical (see CM-14 for related HTTP timeout policy).
+func startCertdMetricsServer(addr string, reg *metrics.Registry) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", reg.Handler())
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		log.Printf("certd: metrics on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("certd: metrics server error: %v", err)
+		}
+	}()
 }
 
 // blockSubmitter serialises block submissions from concurrent goroutines
