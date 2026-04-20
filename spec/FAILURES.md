@@ -247,3 +247,120 @@ slow or unreachable, hanging the addrchain operation.
   management operations.
 
 **Test:** `TestQueryAPITimeout` in `query/server_test.go`.
+
+---
+
+## Category: Kubernetes Integration
+
+### CM-16 — K8s API Server Unreachable
+
+**Risk:** certd cannot reach the Kubernetes API server (network partition, API
+server restart, or certificate expiry). Secret writes fail; K8s consumers cannot
+obtain new TLS certificates, though existing Secrets remain valid.
+
+**Mitigation:**
+- `SecretWriter.Sync` applies exponential backoff starting at 5 s, doubling on
+  each failure, capped at 10 min.
+- The cert store retains the last-known state; existing Secrets already in K8s
+  are unaffected.
+- SecretWriter runs in a separate goroutine so API outages do not block AVX
+  polling or chain sync.
+- Failures are logged at WARN level.
+
+**Test:** `TestSecretWriterAPIUnavailableRetries` in `internal/k8s/secret_writer_test.go`.
+
+---
+
+### CM-17 — RBAC Insufficient to Manage Secrets
+
+**Risk:** The certd ServiceAccount lacks `get`, `create`, `update`, or `delete`
+permissions on Secrets in the configured namespace. Secret writes are rejected
+with HTTP 403 (Forbidden).
+
+**Mitigation:**
+- `SecretWriter.Sync` logs the permission error at ERROR level and skips the
+  offending operation; certd continues running.
+- Operators are alerted via log: "secret write forbidden — check RBAC; Secret not updated".
+- No crash or chain data loss occurs.
+
+**Test:** `TestSecretWriterRBACForbiddenSkips` in `internal/k8s/secret_writer_test.go`.
+
+---
+
+### CM-18 — K8s Headless-Service DNS Discovery Failure
+
+**Risk:** The headless Service hostname used for K8s-native peer discovery cannot
+be resolved (DNS unavailable, Service misconfigured). certd cannot find peers
+inside the cluster.
+
+**Mitigation:**
+- K8s peer discovery is handled by passing the headless Service hostname to
+  `--static-peers`; `StaticPeerSeeder` already resolves and refreshes DNS every
+  15 s.
+- After 3 consecutive DNS resolution failures, a WARN is logged.
+- UDP discovery continues operating as a fallback; certd never fails due to DNS
+  errors alone.
+
+**Test:** `TestStaticPeerSeederDNSFailureFallback` in `internal/peer/discovery_test.go`.
+
+---
+
+### CM-19 — AVX CSR Submission Fails
+
+**Risk:** AppViewX rejects a CSR submitted by the K8s CSR watcher (policy
+violation, auth error, or AVX unreachable during CSR submission). The K8s
+CertificateSigningRequest remains in Pending state indefinitely.
+
+**Mitigation:**
+- Exponential backoff retry (5 s → 10 min, same schedule as CM-01).
+- After max retries, a `Failed` condition is added to the K8s CSR with a reason
+  message; certd logs at ERROR level.
+- The on-chain `TxCertRequest` remains as an immutable audit record (CSR hash,
+  CN, and SANs are recorded at submission time).
+- Operators can resubmit by deleting and recreating the K8s CSR object; the CSR
+  watcher will pick it up on the next watch event.
+
+**Test:** `TestCSRWatcherAVXSubmissionFails` in `internal/k8s/csr_watcher_test.go`.
+
+---
+
+## Category: cert-manager External Issuer
+
+### CM-20 — CertificateRequest Pending Indefinitely
+
+**Risk:** The `certchain-issuer` controller is down, crashing, or unreachable.
+cert-manager `CertificateRequest` objects remain in `Pending` state indefinitely.
+Apps cannot obtain new certificates or renew expiring ones.
+
+**Mitigation:**
+- Deploy `certchain-issuer` with ≥2 replicas and leader election so a single
+  pod failure does not block issuance.
+- Liveness probe on `:8081/healthz` restarts unresponsive pods within 30 s.
+- cert-manager automatically retries `CertificateRequest` objects; once the
+  issuer is restored, pending requests are processed without operator action.
+- Alert when any `CertificateRequest` has been in `Pending` for > 5 minutes
+  (monitor via `certmanager_certificate_ready_status` Prometheus metric).
+
+**Test:** `TestCertificateRequestPendingWhenIssuerDown` in `features/cert_certmanager_issuer.feature`.
+
+---
+
+### CM-21 — Certificate Renewal Race: Expiry Before Renewal Completes
+
+**Risk:** A certificate approaches or passes its `not_after` timestamp while
+`certchain-issuer` or AVX is temporarily unavailable. cert-manager attempts
+renewal before expiry but cannot complete it, leaving the app with an expired
+cert.
+
+**Mitigation:**
+- Operators MUST set `renewBefore` ≥ 30 days in `Certificate` resources (see
+  `deploy/k8s/base/example-certificate.yaml`). This gives a 30-day window for
+  transient outages to resolve without expiry.
+- certchain-issuer runs at ≥2 replicas (CM-20 HA).
+- If renewal does fail past expiry, cert-manager will keep retrying. Once the
+  issuer recovers, a new cert is issued immediately.
+- The old (expired) Secret is NOT deleted until cert-manager successfully issues
+  the replacement, preventing a TLS outage from being replaced by a missing
+  Secret.
+
+**Test:** `TestCertificateRenewalRaceExpiry` in `features/cert_certmanager_issuer.feature`.

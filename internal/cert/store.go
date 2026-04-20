@@ -27,18 +27,24 @@ const (
 
 // Record holds the on-chain metadata for a single certificate.
 type Record struct {
-	CertID      [32]byte
-	CN          string
-	AVXCertID   string
-	NotBefore   int64
-	NotAfter    int64
-	SANs        []string
-	Serial      string
-	Status      Status
+	CertID       [32]byte
+	CN           string
+	AVXCertID    string
+	NotBefore    int64
+	NotAfter     int64
+	SANs         []string
+	Serial       string
+	IssuerDN     string
+	KeyAlgorithm string
+	Template     string
+	Requester    string
+	KeyVaultRef  string
+	Environments []string
+	Status       Status
 	RevokeReason uint8
-	RevokedAt   int64
-	BlockHeight uint32
-	// publisher is the node that submitted the TxCertPublish.
+	RevokedAt    int64
+	BlockHeight  uint32
+	// Publisher is the node that submitted the TxCertPublish.
 	Publisher [32]byte
 }
 
@@ -274,16 +280,22 @@ func (s *Store) applyPublish(tx *chain.Transaction, blockHeight uint32, blockTim
 	}
 
 	rec := &Record{
-		CertID:      p.CertID,
-		CN:          p.CN,
-		AVXCertID:   p.AVXCertID,
-		NotBefore:   p.NotBefore,
-		NotAfter:    p.NotAfter,
-		SANs:        p.SANs,
-		Serial:      p.Serial,
-		Status:      status,
-		BlockHeight: blockHeight,
-		Publisher:   tx.NodePubkey,
+		CertID:       p.CertID,
+		CN:           p.CN,
+		AVXCertID:    p.AVXCertID,
+		NotBefore:    p.NotBefore,
+		NotAfter:     p.NotAfter,
+		SANs:         p.SANs,
+		Serial:       p.Serial,
+		IssuerDN:     p.IssuerDN,
+		KeyAlgorithm: p.KeyAlgorithm,
+		Template:     p.Template,
+		Requester:    p.Requester,
+		KeyVaultRef:  p.KeyVaultRef,
+		Environments: p.Environments,
+		Status:       status,
+		BlockHeight:  blockHeight,
+		Publisher:    tx.NodePubkey,
 	}
 	s.byID[p.CertID] = rec
 

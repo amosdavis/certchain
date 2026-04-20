@@ -51,6 +51,8 @@ type Cert struct {
 	NotAfter   time.Time `json:"notAfter"`
 	SANs       []string  `json:"subjectAltNames"`
 	Serial     string    `json:"serialNumber"`
+	Template   string    `json:"templateName,omitempty"`
+	Requester  string    `json:"requestedBy,omitempty"`
 }
 
 // Client polls the AppViewX REST API for certificate events.
@@ -172,6 +174,96 @@ func (c *Client) PollIntervalWithJitter() time.Duration {
 	return base + jitter
 }
 
+// SubmitCSR submits a PKCS#10 DER-encoded CSR to AppViewX for issuance.
+// Returns the AVX request ID that can be used with GetRequestStatus.
+func (c *Client) SubmitCSR(ctx context.Context, csrDER []byte) (string, error) {
+	url := fmt.Sprintf("%s/avxapi/certificate/request", c.cfg.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url,
+		bytes.NewReader(csrDER))
+	if err != nil {
+		return "", err
+	}
+	c.setAuthHeader(req)
+	req.Header.Set("Content-Type", "application/pkcs10")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("AVX CSR submit: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
+		// handled below
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "", fmt.Errorf("AVX CSR submit auth error: HTTP %d", resp.StatusCode)
+	default:
+		return "", fmt.Errorf("AVX CSR submit unexpected status: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("AVX CSR submit read body: %w", err)
+	}
+	var result struct {
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("AVX CSR submit JSON parse: %w", err)
+	}
+	if result.RequestID == "" {
+		return "", fmt.Errorf("AVX CSR submit: empty requestId in response")
+	}
+	return result.RequestID, nil
+}
+
+// CSRStatus holds the result of polling an AVX certificate request.
+type CSRStatus struct {
+	RequestID string
+	Status    string // "PENDING", "ISSUED", "REJECTED", "FAILED"
+	CertID    string // AVX cert ID, non-empty when Status == "ISSUED"
+}
+
+// GetRequestStatus polls AppViewX for the status of a previously submitted CSR.
+func (c *Client) GetRequestStatus(ctx context.Context, requestID string) (*CSRStatus, error) {
+	url := fmt.Sprintf("%s/avxapi/certificate/request/%s", c.cfg.BaseURL, requestID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setAuthHeader(req)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("AVX CSR status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("AVX CSR status unexpected response: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("AVX CSR status read body: %w", err)
+	}
+	var result struct {
+		RequestID string `json:"requestId"`
+		Status    string `json:"status"`
+		CertID    string `json:"certId"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("AVX CSR status JSON parse: %w", err)
+	}
+	return &CSRStatus{
+		RequestID: requestID,
+		Status:    result.Status,
+		CertID:    result.CertID,
+	}, nil
+}
+
 // RenewCert requests AppViewX to renew the certificate with the given AVX cert ID.
 // The renewed certificate will appear in the next Poll cycle as a new cert.
 func (c *Client) RenewCert(ctx context.Context, avxCertID string) error {
@@ -199,63 +291,6 @@ func (c *Client) RenewCert(ctx context.Context, avxCertID string) error {
 	default:
 		return fmt.Errorf("AVX renew unexpected status: %d", resp.StatusCode)
 	}
-}
-
-// csrRequest is the payload sent to AppViewX to request certificate issuance via CSR.
-type csrRequest struct {
-	CommonName      string   `json:"commonName"`
-	SubjectAltNames []string `json:"subjectAltNames,omitempty"`
-	CSR             string   `json:"csr"` // PEM-encoded
-	ValidityDays    int      `json:"validityDays"`
-}
-
-// SubmitCSR submits a PEM-encoded CSR to AppViewX and returns the AVX request ID.
-// validityDays of 0 defaults to 365.
-func (c *Client) SubmitCSR(ctx context.Context, cn string, sans []string, csrPEM []byte, validityDays int) (string, error) {
-	if validityDays == 0 {
-		validityDays = 365
-	}
-	body, err := json.Marshal(csrRequest{
-		CommonName:      cn,
-		SubjectAltNames: sans,
-		CSR:             string(csrPEM),
-		ValidityDays:    validityDays,
-	})
-	if err != nil {
-		return "", err
-	}
-	url := fmt.Sprintf("%s/avxapi/certificate/request", c.cfg.BaseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	c.setAuthHeader(req)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("AVX CSR submit: %w", err)
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
-	case http.StatusConflict:
-		return "", fmt.Errorf("AVX CSR already pending for %s", cn)
-	default:
-		return "", fmt.Errorf("AVX CSR submit: HTTP %d", resp.StatusCode)
-	}
-
-	var result struct {
-		RequestID string `json:"requestId"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("AVX CSR response decode: %w", err)
-	}
-	if result.RequestID == "" {
-		return "", fmt.Errorf("AVX CSR response: empty requestId")
-	}
-	return result.RequestID, nil
 }
 
 // ---- private helpers ----

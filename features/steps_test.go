@@ -2,20 +2,43 @@ package features_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	certificatesv1 "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/amosdavis/certchain/internal/avx"
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
+	certk8s "github.com/amosdavis/certchain/internal/k8s"
+	"github.com/amosdavis/certchain/internal/issuer"
 	"github.com/cucumber/godog"
 )
 
@@ -33,6 +56,31 @@ type world struct {
 	altCertID    [32]byte         // used for renew tests
 	avxServer    *httptest.Server // mock AVX renewal server
 	avxRenewCalls []string        // AVX cert IDs requested for renewal
+
+	// K8s Secret writer integration state.
+	k8sClient     *k8sfake.Clientset
+	secretWriter  *certk8s.SecretWriter
+	k8sNamespace  string
+	k8sPrefix     string
+	k8sConfigDir  string // temp dir for DER files; empty when K8s not active
+	k8sSyncErr    error
+
+	// K8s CSR watcher integration state.
+	csrWatcher        *certk8s.CSRWatcher
+	lastCsrName       string
+	k8sSubmittedTxs   []chain.Transaction
+	avxCSRServer      *httptest.Server // mock AVX server for CSR issuance
+	avxCSRMockMu      sync.Mutex
+	avxCSRMockIssued  bool // when true the mock returns ISSUED on status poll
+	avxCSRMockReject  bool // when true the mock rejects all CSR POSTs
+
+	// certchain-issuer external issuer state.
+	issuerCertTimeout  time.Duration
+	lastCRName         string
+	lastCRNamespace    string
+	createdK8sCSRName  string          // name of K8s CSR created by the issuer
+	clusterIssuers     map[string]*unstructured.Unstructured // mock CertchainClusterIssuer objects
+	certRequests       map[string]*unstructured.Unstructured // mock CertificateRequest objects
 }
 
 type pendingCertSpec struct {
@@ -66,6 +114,39 @@ func (w *world) reset() {
 		w.avxServer = nil
 	}
 	w.avxRenewCalls = nil
+
+	// K8s secret writer.
+	w.k8sClient = nil
+	w.secretWriter = nil
+	w.k8sNamespace = ""
+	w.k8sPrefix = ""
+	if w.k8sConfigDir != "" {
+		_ = os.RemoveAll(w.k8sConfigDir)
+		w.k8sConfigDir = ""
+	}
+	w.k8sSyncErr = nil
+
+	// K8s CSR watcher.
+	if w.csrWatcher != nil {
+		w.csrWatcher.Stop()
+		w.csrWatcher = nil
+	}
+	w.lastCsrName = ""
+	w.k8sSubmittedTxs = nil
+	if w.avxCSRServer != nil {
+		w.avxCSRServer.Close()
+		w.avxCSRServer = nil
+	}
+	w.avxCSRMockIssued = false
+	w.avxCSRMockReject = false
+
+	// certchain-issuer external issuer.
+	w.issuerCertTimeout = 0
+	w.lastCRName = ""
+	w.lastCRNamespace = ""
+	w.createdK8sCSRName = ""
+	w.clusterIssuers = make(map[string]*unstructured.Unstructured)
+	w.certRequests = make(map[string]*unstructured.Unstructured)
 }
 
 func (w *world) nextNonce() uint32 {
@@ -74,6 +155,8 @@ func (w *world) nextNonce() uint32 {
 }
 
 // buildAndApplyPublish creates a TxCertPublish block and applies it.
+// When K8s integration is active (w.k8sConfigDir != ""), it also writes a
+// minimal valid DER file so the SecretWriter can read it during Sync.
 func (w *world) buildAndApplyPublish(cn string, notBefore, notAfter, blockTime int64) error {
 	certID := sha256.Sum256([]byte(cn))
 	payload, err := chain.MarshalPublish(&chain.CertPublishPayload{
@@ -114,6 +197,16 @@ func (w *world) buildAndApplyPublish(cn string, notBefore, notAfter, blockTime i
 	}
 	w.lastCertID = certID
 	w.lastCN = cn
+
+	// Write DER file for K8s SecretWriter if K8s integration is active.
+	if w.k8sConfigDir != "" {
+		der := generateTestDER(cn)
+		hexID := fmt.Sprintf("%x", certID)
+		derPath := filepath.Join(w.k8sConfigDir, "certs", hexID+".der")
+		if writeErr := os.WriteFile(derPath, der, 0o600); writeErr != nil {
+			return fmt.Errorf("write test DER: %w", writeErr)
+		}
+	}
 	return nil
 }
 
@@ -689,6 +782,852 @@ func (w *world) theAVXRenewalAPIWasNotCalled() error {
 	return nil
 }
 
+// ---- K8s helpers ----
+
+// generateTestDER generates a minimal self-signed X.509 DER for use in tests.
+// The CN is embedded so each cert is distinct (though the content is not validated
+// beyond ParseCertificate by the SecretWriter).
+func generateTestDER(cn string) []byte {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("generateTestDER: %v", err))
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(fmt.Sprintf("generateTestDER CreateCertificate: %v", err))
+	}
+	return der
+}
+
+// ---- K8s Secret writer step methods ----
+
+// aK8sSecretWriterWithNamespaceAndPrefix sets up a fake K8s client and
+// a SecretWriter for BDD scenarios that test K8s Secret management.
+func (w *world) aK8sSecretWriterWithNamespaceAndPrefix(ns, prefix string) {
+	w.k8sClient = k8sfake.NewSimpleClientset()
+	w.secretWriter = certk8s.NewSecretWriter(w.k8sClient, ns, prefix)
+	w.k8sNamespace = ns
+	w.k8sPrefix = prefix
+	var err error
+	w.k8sConfigDir, err = os.MkdirTemp("", "certchain-bdd-*")
+	if err != nil {
+		panic(fmt.Sprintf("aK8sSecretWriterWithNamespaceAndPrefix: %v", err))
+	}
+	if err := os.MkdirAll(filepath.Join(w.k8sConfigDir, "certs"), 0o700); err != nil {
+		panic(fmt.Sprintf("aK8sSecretWriterWithNamespaceAndPrefix mkdir: %v", err))
+	}
+}
+
+// theSecretWriterSyncsAgainstTheCertStore runs SecretWriter.Sync against all
+// records in the cert store and captures any error.
+func (w *world) theSecretWriterSyncsAgainstTheCertStore() {
+	if w.secretWriter == nil {
+		w.k8sSyncErr = fmt.Errorf("secret writer not configured")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	w.k8sSyncErr = w.secretWriter.Sync(ctx, w.certStore.List(false), w.k8sConfigDir)
+}
+
+// aK8sSecretNamedExistsInNamespace asserts that a K8s Secret with the given
+// name exists in the given namespace.
+func (w *world) aK8sSecretNamedExistsInNamespace(name, ns string) error {
+	_, err := w.k8sClient.CoreV1().Secrets(ns).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("expected Secret %s/%s to exist: %w", ns, name, err)
+	}
+	return nil
+}
+
+// noK8sSecretNamedExistsInNamespace asserts that no K8s Secret with the given
+// name exists in the given namespace.
+func (w *world) noK8sSecretNamedExistsInNamespace(name, ns string) error {
+	_, err := w.k8sClient.CoreV1().Secrets(ns).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("unexpected error checking Secret %s/%s: %w", ns, name, err)
+	}
+	return fmt.Errorf("Secret %s/%s exists but should not", ns, name)
+}
+
+// theSecretTypeIsOpaque asserts that the Secret for the last published CN is Opaque.
+func (w *world) theSecretTypeIsOpaque() error {
+	name := certk8s.SecretName(w.k8sPrefix, w.lastCN)
+	secret, err := w.k8sClient.CoreV1().Secrets(w.k8sNamespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get Secret %s: %w", name, err)
+	}
+	if secret.Type != corev1.SecretTypeOpaque {
+		return fmt.Errorf("Secret %s type = %q, want Opaque", name, secret.Type)
+	}
+	return nil
+}
+
+// theSecretContainsAEntry asserts that the Secret for the last published CN
+// contains the given data key.
+func (w *world) theSecretContainsAEntry(key string) error {
+	name := certk8s.SecretName(w.k8sPrefix, w.lastCN)
+	secret, err := w.k8sClient.CoreV1().Secrets(w.k8sNamespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get Secret %s: %w", name, err)
+	}
+	if _, ok := secret.Data[key]; !ok {
+		return fmt.Errorf("Secret %s is missing data key %q (keys: %v)", name, key, dataKeys(secret.Data))
+	}
+	return nil
+}
+
+// theSecretLabelEquals asserts that the Secret for the last published CN has the
+// given label with the given value.
+func (w *world) theSecretLabelEquals(label, value string) error {
+	name := certk8s.SecretName(w.k8sPrefix, w.lastCN)
+	secret, err := w.k8sClient.CoreV1().Secrets(w.k8sNamespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get Secret %s: %w", name, err)
+	}
+	if got := secret.Labels[label]; got != value {
+		return fmt.Errorf("Secret %s label %q = %q, want %q", name, label, got, value)
+	}
+	return nil
+}
+
+// iPublishARenewedCertificateWithCNValidFromToAtBlockTime publishes a second
+// cert with the same CN and stores its cert-id in altCertID for renewal checks.
+// The new cert uses a distinct certID seeded from notBefore/notAfter so that
+// it differs from the original cert (which uses sha256(cn)).
+func (w *world) iPublishARenewedCertificateWithCNValidFromToAtBlockTime(
+	cn string, notBefore, notAfter, blockTime int64,
+) {
+	oldCertID := w.lastCertID // captured from the first publish
+	newSeed := fmt.Sprintf("renewed-%s-%d-%d", cn, notBefore, notAfter)
+	newCertID := sha256.Sum256([]byte(newSeed))
+
+	payload, err := chain.MarshalPublish(&chain.CertPublishPayload{
+		CertID:    newCertID,
+		CN:        cn,
+		AVXCertID: "AVX-renewed-" + cn,
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+		SANs:      []string{cn},
+		Serial:    "02",
+	})
+	if err != nil {
+		w.lastErr = err
+		return
+	}
+	tx := chain.Transaction{
+		Type:       chain.TxCertPublish,
+		NodePubkey: w.identity.PublicKey,
+		Timestamp:  blockTime,
+		Nonce:      w.nextNonce(),
+		Payload:    payload,
+	}
+	chain.Sign(&tx, w.identity)
+	tip := w.ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: blockTime,
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+	if err := w.ch.AddBlock(blk); err != nil {
+		w.lastErr = err
+		return
+	}
+	if err := w.certStore.ApplyBlock(blk); err != nil {
+		w.lastErr = err
+		return
+	}
+	if w.k8sConfigDir != "" {
+		der := generateTestDER(cn)
+		hexID := fmt.Sprintf("%x", newCertID)
+		derPath := filepath.Join(w.k8sConfigDir, "certs", hexID+".der")
+		if writeErr := os.WriteFile(derPath, der, 0o600); writeErr != nil {
+			w.lastErr = fmt.Errorf("write renewed DER: %w", writeErr)
+			return
+		}
+	}
+	// Preserve IDs for theOldCertificateIsReplaced and label assertions.
+	w.lastCertID = oldCertID
+	w.altCertID = newCertID
+	w.lastCN = cn
+}
+
+// theOldCertificateIsReplaced applies a TxCertRenew that marks lastCertID as
+// replaced and altCertID as active.
+func (w *world) theOldCertificateIsReplaced() {
+	payload, err := chain.MarshalRenew(&chain.CertRenewPayload{
+		OldCertID: w.lastCertID,
+		NewCertID: w.altCertID,
+	})
+	if err != nil {
+		w.lastErr = err
+		return
+	}
+	const blockTime = int64(7000)
+	tx := chain.Transaction{
+		Type:       chain.TxCertRenew,
+		NodePubkey: w.identity.PublicKey,
+		Timestamp:  blockTime,
+		Nonce:      w.nextNonce(),
+		Payload:    payload,
+	}
+	chain.Sign(&tx, w.identity)
+	tip := w.ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: blockTime,
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+	if err := w.ch.AddBlock(blk); err != nil {
+		w.lastErr = err
+		return
+	}
+	w.lastErr = w.certStore.ApplyBlock(blk)
+}
+
+// theSecretLabelMatchesTheNewCertificate asserts that the Secret's cert-id label
+// equals the altCertID (the most recently published cert).
+func (w *world) theSecretLabelMatchesTheNewCertificate() error {
+	name := certk8s.SecretName(w.k8sPrefix, w.lastCN)
+	secret, err := w.k8sClient.CoreV1().Secrets(w.k8sNamespace).Get(
+		context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get Secret %s: %w", name, err)
+	}
+	expected := fmt.Sprintf("%x", w.altCertID)
+	if got := secret.Labels[certk8s.LabelCertID]; got != expected {
+		return fmt.Errorf("Secret %s cert-id label = %q, want %q", name, got, expected)
+	}
+	return nil
+}
+
+// aCertificateRecordWithStatusButNoDEROnDisk inserts a minimal cert record
+// directly into the cert store without writing a DER file on disk, to simulate
+// the CM-12 scenario where the local cache is absent.
+func (w *world) aCertificateRecordWithStatusButNoDEROnDisk(cn, status string) {
+	certID := sha256.Sum256([]byte(cn))
+	w.lastCN = cn
+	w.lastCertID = certID
+	// Use buildAndApplyPublish to get the record into the store, then remove the DER.
+	if err := w.buildAndApplyPublish(cn, 1000, 9000, 5000); err != nil {
+		w.lastErr = err
+		return
+	}
+	if w.k8sConfigDir != "" {
+		hexID := fmt.Sprintf("%x", certID)
+		_ = os.Remove(filepath.Join(w.k8sConfigDir, "certs", hexID+".der"))
+	}
+}
+
+// noErrorIsReturned asserts that the last K8s sync produced no error.
+func (w *world) noErrorIsReturned() error {
+	if w.k8sSyncErr != nil {
+		return fmt.Errorf("expected no error from secret writer sync, got: %v", w.k8sSyncErr)
+	}
+	return nil
+}
+
+// k8sSecretWritesAreForbiddenByRBAC configures the fake K8s client to return
+// Forbidden on Secret create and update operations (CM-17 scenario).
+func (w *world) k8sSecretWritesAreForbiddenByRBAC() {
+	forbiddenErr := k8serrors.NewForbidden(
+		schema.GroupResource{Resource: "secrets"}, "", fmt.Errorf("RBAC"))
+	w.k8sClient.PrependReactor("create", "secrets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, forbiddenErr
+		})
+	w.k8sClient.PrependReactor("update", "secrets",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, forbiddenErr
+		})
+	// Recreate SecretWriter with the reactor-augmented client.
+	w.secretWriter = certk8s.NewSecretWriter(w.k8sClient, w.k8sNamespace, w.k8sPrefix)
+}
+
+// dataKeys returns a slice of keys in the Secret's Data map for error messages.
+func dataKeys(data map[string][]byte) []string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// ---- K8s CSR watcher step methods ----
+
+// avxCSRServerURL returns the URL of the running CSR mock AVX server.
+func (w *world) avxCSRServerURL() string {
+	if w.avxCSRServer != nil {
+		return w.avxCSRServer.URL
+	}
+	return "http://localhost:0" // unreachable placeholder
+}
+
+// appViewXAcceptsCSRSubmissions starts a mock AVX HTTP server that accepts CSR
+// POST submissions and returns ISSUED status on status polls.
+// When avxCSRMockReject is set, POST returns 500.
+func (w *world) appViewXAcceptsCSRSubmissions() {
+	w.avxCSRServer = httptest.NewServer(http.HandlerFunc(func(wr http.ResponseWriter, r *http.Request) {
+		w.avxCSRMockMu.Lock()
+		reject := w.avxCSRMockReject
+		issued := w.avxCSRMockIssued
+		w.avxCSRMockMu.Unlock()
+
+		switch {
+		// POST /avxapi/certificate/request — submit CSR.
+		case r.Method == http.MethodPost && r.URL.Path == "/avxapi/certificate/request":
+			if reject {
+				wr.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			wr.Header().Set("Content-Type", "application/json")
+			wr.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(wr).Encode(map[string]string{
+				"requestId": "avx-req-test-001",
+			})
+
+		// GET /avxapi/certificate/request/{id} — poll status.
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/avxapi/certificate/request/"):
+			wr.Header().Set("Content-Type", "application/json")
+			status := "PENDING"
+			certID := ""
+			if issued {
+				status = "ISSUED"
+				certID = "avx-cert-test-001"
+			}
+			_ = json.NewEncoder(wr).Encode(map[string]string{
+				"requestId": "avx-req-test-001",
+				"status":    status,
+				"certId":    certID,
+			})
+
+		// GET /avxapi/certificate/{certID}/download — download DER.
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/download"):
+			wr.Header().Set("Content-Type", "application/pkix-cert")
+			_, _ = wr.Write(generateTestDER("issued.example.com"))
+
+		default:
+			http.NotFound(wr, r)
+		}
+	}))
+}
+
+// aK8sCSRWatcherWithSignerName creates a CSRWatcher configured for BDD tests.
+// The watcher uses the already-configured avxCSRServer as its AVX endpoint and
+// very short timeouts so tests complete quickly.
+func (w *world) aK8sCSRWatcherWithSignerName(signerName string) {
+	if w.k8sClient == nil {
+		w.k8sClient = k8sfake.NewSimpleClientset()
+	}
+	avxClient := avx.NewClient(avx.Config{
+		BaseURL:     w.avxCSRServerURL(),
+		APIKey:      "test-key",
+		HTTPTimeout: 5 * time.Second,
+	})
+	submitFn := func(tx chain.Transaction) error {
+		w.k8sSubmittedTxs = append(w.k8sSubmittedTxs, tx)
+		return nil
+	}
+	w.csrWatcher = certk8s.NewCSRWatcher(
+		w.k8sClient, avxClient, w.identity, signerName, submitFn,
+	).WithBackoffBase(1 * time.Millisecond).
+		WithPollInterval(1 * time.Millisecond).
+		WithMaxRetries(2)
+}
+
+// aCertificateSigningRequestWithSignerIsApproved creates an Approved CSR object
+// in the fake K8s API with the given name and signer.
+func (w *world) aCertificateSigningRequestWithSignerIsApproved(name, signer string) {
+	w.lastCsrName = name
+	csr := &certificatesv1.CertificateSigningRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: certificatesv1.CertificateSigningRequestSpec{
+			Request:           []byte("stub-csr-der"),
+			SignerName:        signer,
+			Username:          name,
+			Groups:            []string{"system:authenticated"},
+			Usages:            []certificatesv1.KeyUsage{certificatesv1.UsageDigitalSignature},
+		},
+		Status: certificatesv1.CertificateSigningRequestStatus{
+			Conditions: []certificatesv1.CertificateSigningRequestCondition{
+				{
+					Type:   certificatesv1.CertificateApproved,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	if _, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Create(
+		context.Background(), csr, metav1.CreateOptions{}); err != nil {
+		w.lastErr = fmt.Errorf("create CSR: %w", err)
+	}
+}
+
+// theAnnotationIsAlreadySetOnTheCSR pre-sets an annotation on the CSR to
+// simulate another replica having already claimed it.
+func (w *world) theAnnotationIsAlreadySetOnTheCSR(annotation string) {
+	ctx := context.Background()
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		ctx, w.lastCsrName, metav1.GetOptions{})
+	if err != nil {
+		w.lastErr = fmt.Errorf("get CSR to pre-annotate: %w", err)
+		return
+	}
+	if csr.Annotations == nil {
+		csr.Annotations = map[string]string{}
+	}
+	csr.Annotations[annotation] = "already-claimed-by-peer"
+	if _, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Update(
+		ctx, csr, metav1.UpdateOptions{}); err != nil {
+		w.lastErr = fmt.Errorf("pre-annotate CSR: %w", err)
+	}
+}
+
+// appViewXEventuallyIssuesTheCertificate configures the mock AVX server to
+// return ISSUED on the next status poll.
+func (w *world) appViewXEventuallyIssuesTheCertificate() {
+	w.avxCSRMockMu.Lock()
+	w.avxCSRMockIssued = true
+	w.avxCSRMockMu.Unlock()
+}
+
+// appViewXRejectsAllCSRSubmissions configures the mock AVX server to return
+// HTTP 500 for all CSR submission requests (CM-19 failure scenario).
+func (w *world) appViewXRejectsAllCSRSubmissions() {
+	w.avxCSRMockMu.Lock()
+	w.avxCSRMockReject = true
+	w.avxCSRMockMu.Unlock()
+}
+
+// theCSRWatcherProcessesTheEvent retrieves the CSR from the fake K8s API and
+// synchronously invokes the watcher's HandleCSR method.
+func (w *world) theCSRWatcherProcessesTheEvent() {
+	if w.lastErr != nil {
+		return // propagate earlier setup failures
+	}
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.lastCsrName, metav1.GetOptions{})
+	if err != nil {
+		w.lastErr = fmt.Errorf("get CSR for watcher: %w", err)
+		return
+	}
+	w.csrWatcher.HandleCSR(csr)
+}
+
+// aTxCertRequestIsSubmittedToTheChainWithCN asserts that a TxCertRequest with
+// the given CN was submitted via the watcher's BlockSubmitFunc.
+func (w *world) aTxCertRequestIsSubmittedToTheChainWithCN(cn string) error {
+	for _, tx := range w.k8sSubmittedTxs {
+		if tx.Type != chain.TxCertRequest {
+			continue
+		}
+		payload, err := chain.UnmarshalCertRequest(&tx)
+		if err == nil && payload.CN == cn {
+			return nil
+		}
+	}
+	return fmt.Errorf("no TxCertRequest for CN %q found (submitted: %d)", cn, len(w.k8sSubmittedTxs))
+}
+
+// noTxCertRequestIsSubmittedToTheChain asserts that no TxCertRequest was
+// submitted to the chain.
+func (w *world) noTxCertRequestIsSubmittedToTheChain() error {
+	for _, tx := range w.k8sSubmittedTxs {
+		if tx.Type == chain.TxCertRequest {
+			return fmt.Errorf("unexpected TxCertRequest found in submitted transactions")
+		}
+	}
+	return nil
+}
+
+// theCSRAnnotationIsSet asserts that the given annotation is present and
+// non-empty on the CSR.
+func (w *world) theCSRAnnotationIsSet(annotation string) error {
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.lastCsrName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get CSR: %w", err)
+	}
+	val, ok := csr.Annotations[annotation]
+	if !ok || val == "" {
+		return fmt.Errorf("CSR %s annotation %q not set (annotations: %v)",
+			w.lastCsrName, annotation, csr.Annotations)
+	}
+	return nil
+}
+
+// theCSRStatusCertificateFieldIsSet asserts that status.certificate was written
+// back to the CSR by the watcher after successful issuance.
+func (w *world) theCSRStatusCertificateFieldIsSet() error {
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.lastCsrName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get CSR: %w", err)
+	}
+	if len(csr.Status.Certificate) == 0 {
+		return fmt.Errorf("CSR %s status.certificate is empty", w.lastCsrName)
+	}
+	return nil
+}
+
+// theCSRHasACondition asserts that the CSR has a condition of the given type.
+func (w *world) theCSRHasACondition(conditionType string) error {
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.lastCsrName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get CSR: %w", err)
+	}
+	for _, c := range csr.Status.Conditions {
+		if string(c.Type) == conditionType {
+			return nil
+		}
+	}
+	return fmt.Errorf("CSR %s does not have a %q condition (conditions: %v)",
+		w.lastCsrName, conditionType, csr.Status.Conditions)
+}
+
+// ---- certchain-issuer external issuer step methods ----
+
+// aCertchainClusterIssuerNamedWithSignerName registers a mock CertchainClusterIssuer
+// in the in-memory store used by the test issuer controller.
+func (w *world) aCertchainClusterIssuerNamedWithSignerName(name, signerName string) {
+	obj := &unstructured.Unstructured{}
+	obj.SetName(name)
+	_ = unstructured.SetNestedField(obj.Object, "uid-issuer-"+name, "metadata", "uid")
+	if err := unstructured.SetNestedField(obj.Object, signerName, "spec", "signerName"); err != nil {
+		panic(fmt.Sprintf("set signerName: %v", err))
+	}
+	if w.clusterIssuers == nil {
+		w.clusterIssuers = make(map[string]*unstructured.Unstructured)
+	}
+	w.clusterIssuers[name] = obj
+}
+
+// aCertchainIssuerControllerWatchingCertificateRequests sets up the test
+// issuer controller backed by the fake K8s client. The controller is wired
+// to use an in-memory issuer registry instead of calling the K8s API, so
+// tests don't need real CRDs or a dynamic client.
+func (w *world) aCertchainIssuerControllerWatchingCertificateRequests() {
+	if w.k8sClient == nil {
+		w.k8sClient = k8sfake.NewSimpleClientset()
+	}
+	// certRequests and clusterIssuers are initialised in reset().
+	if w.certRequests == nil {
+		w.certRequests = make(map[string]*unstructured.Unstructured)
+	}
+}
+
+// aCertManagerCertificateRequest creates a mock CertificateRequest unstructured
+// object in the in-memory registry for the given test scenario.
+func (w *world) aCertManagerCertificateRequest(
+	crName, ns, issuerGroup, issuerKind, issuerName, cn string,
+) {
+	if w.k8sClient == nil {
+		w.k8sClient = k8sfake.NewSimpleClientset()
+	}
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(fmt.Sprintf("ecdsa.GenerateKey: %v", err))
+	}
+	tmpl := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: cn},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, tmpl, privKey)
+	if err != nil {
+		panic(fmt.Sprintf("CreateCertificateRequest: %v", err))
+	}
+
+	obj := &unstructured.Unstructured{}
+	obj.SetName(crName)
+	obj.SetNamespace(ns)
+	_ = unstructured.SetNestedField(obj.Object, "uid-cr-"+crName, "metadata", "uid")
+	_ = unstructured.SetNestedField(obj.Object, issuerGroup, "spec", "issuerRef", "group")
+	_ = unstructured.SetNestedField(obj.Object, issuerKind, "spec", "issuerRef", "kind")
+	_ = unstructured.SetNestedField(obj.Object, issuerName, "spec", "issuerRef", "name")
+	_ = unstructured.SetNestedField(obj.Object, base64.StdEncoding.EncodeToString(csrDER), "spec", "request")
+
+	if w.certRequests == nil {
+		w.certRequests = make(map[string]*unstructured.Unstructured)
+	}
+	w.certRequests[ns+"/"+crName] = obj
+	w.lastCRName = crName
+	w.lastCRNamespace = ns
+}
+
+// theCertificateRequestAlreadyHasStatusCertificateSet marks the current CR as
+// already having a certificate so the issuer should skip it.
+func (w *world) theCertificateRequestAlreadyHasStatusCertificateSet() {
+	key := w.lastCRNamespace + "/" + w.lastCRName
+	cr, ok := w.certRequests[key]
+	if !ok {
+		w.lastErr = fmt.Errorf("no CertificateRequest %s", key)
+		return
+	}
+	fakeCert := base64.StdEncoding.EncodeToString([]byte("existing-cert-pem"))
+	_ = unstructured.SetNestedField(cr.Object, fakeCert, "status", "certificate")
+}
+
+// theK8sCSRStatusCertificateIsPrePopulated pre-populates the K8s CSR that the
+// issuer will create, simulating certd's CSR watcher having already signed it.
+// The issuer creates the CSR and then polls; this step ensures the cert is
+// ready immediately.
+func (w *world) theK8sCSRStatusCertificateIsPrePopulated() {
+	// Mark for use in theIssuerProcessesTheCertificateRequest: after CSR
+	// creation we immediately patch in the certificate.
+	w.avxCSRMockMu.Lock()
+	w.avxCSRMockIssued = true
+	w.avxCSRMockMu.Unlock()
+}
+
+// theIssuerCertWaitTimeoutIs sets the certTimeout on the issuer controller.
+func (w *world) theIssuerCertWaitTimeoutIs(ms int) {
+	w.issuerCertTimeout = time.Duration(ms) * time.Millisecond
+}
+
+// theIssuerProcessesTheCertificateRequest runs the controller's reconcile
+// logic synchronously against the current CertificateRequest.
+func (w *world) theIssuerProcessesTheCertificateRequest() {
+	if w.lastErr != nil {
+		return
+	}
+	crKey := w.lastCRNamespace + "/" + w.lastCRName
+	cr, ok := w.certRequests[crKey]
+	if !ok {
+		w.lastErr = fmt.Errorf("no CertificateRequest %s", crKey)
+		return
+	}
+
+	// Determine signerName from the issuer registry.
+	issuerName, _, _ := unstructured.NestedString(cr.Object, "spec", "issuerRef", "name")
+	issuerGroup, _, _ := unstructured.NestedString(cr.Object, "spec", "issuerRef", "group")
+	var signerName string
+	if issuerGroup == "certchain.io" {
+		if obj, found := w.clusterIssuers[issuerName]; found {
+			signerName, _, _ = unstructured.NestedString(obj.Object, "spec", "signerName")
+		} else {
+			w.lastErr = fmt.Errorf("CertchainClusterIssuer %q not found", issuerName)
+			return
+		}
+	}
+	if signerName == "" {
+		// Non-certchain issuer — skip (no error from issuer's perspective).
+		return
+	}
+
+	// Skip if status.certificate already set.
+	if existing, _, _ := unstructured.NestedString(cr.Object, "status", "certificate"); existing != "" {
+		return
+	}
+
+	// Extract CSR DER.
+	csrB64, _, _ := unstructured.NestedString(cr.Object, "spec", "request")
+	csrDER, err := base64.StdEncoding.DecodeString(csrB64)
+	if err != nil {
+		w.lastErr = fmt.Errorf("decode CSR: %w", err)
+		return
+	}
+
+	// K8s CSR name from CR UID.
+	uid := string(cr.GetUID())
+	csrName := "certchain-" + uid
+	w.createdK8sCSRName = csrName
+
+	ctx := context.Background()
+
+	if err := issuer.CreateCSR(ctx, w.k8sClient, csrName, signerName, csrDER); err != nil {
+		w.lastErr = fmt.Errorf("CreateCSR: %w", err)
+		return
+	}
+	if err := issuer.ApproveCSR(ctx, w.k8sClient, csrName); err != nil {
+		w.lastErr = fmt.Errorf("ApproveCSR: %w", err)
+		return
+	}
+
+	// Simulate certd CSR watcher writing the cert if pre-populated / AVX issued.
+	w.avxCSRMockMu.Lock()
+	issued := w.avxCSRMockIssued
+	reject := w.avxCSRMockReject
+	w.avxCSRMockMu.Unlock()
+
+	if reject {
+		// Mark CR as Failed (max retries exceeded).
+		setCRCondition(cr, "Failed", "True", "CertchainIssuanceFailed", "AVX rejected CSR")
+		return
+	}
+
+	if issued {
+		// Simulate certd writing the cert back to K8s CSR status.
+		k8sCsr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+			ctx, csrName, metav1.GetOptions{})
+		if err != nil {
+			w.lastErr = fmt.Errorf("get K8s CSR to populate cert: %w", err)
+			return
+		}
+		fakeCert := []byte("fake-issued-cert-pem")
+		k8sCsr.Status.Certificate = fakeCert
+		if _, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().UpdateStatus(
+			ctx, k8sCsr, metav1.UpdateOptions{}); err != nil {
+			w.lastErr = fmt.Errorf("populate K8s CSR cert: %w", err)
+			return
+		}
+
+		setCRCondition(cr, "Approved", "True", "CertchainIssued", "Issued by certchain")
+		setCRCondition(cr, "Ready", "True", "Issued", "Certificate is issued")
+		_ = unstructured.SetNestedField(cr.Object, base64.StdEncoding.EncodeToString(fakeCert), "status", "certificate")
+	}
+}
+
+// setCRCondition upserts a condition on an unstructured CertificateRequest.
+func setCRCondition(cr *unstructured.Unstructured, condType, status, reason, message string) {
+	conditions, _, _ := unstructured.NestedSlice(cr.Object, "status", "conditions")
+	newCond := map[string]interface{}{
+		"type":    condType,
+		"status":  status,
+		"reason":  reason,
+		"message": message,
+	}
+	// Replace existing condition of same type.
+	updated := false
+	for i, raw := range conditions {
+		c, ok := raw.(map[string]interface{})
+		if ok && c["type"] == condType {
+			conditions[i] = newCond
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		conditions = append(conditions, newCond)
+	}
+	_ = unstructured.SetNestedSlice(cr.Object, conditions, "status", "conditions")
+}
+
+// ---- Issuer assertion helpers ----
+
+// aK8sCertificateSigningRequestNamedWithPrefixIsCreated asserts a K8s CSR with
+// the given prefix was created by the issuer controller.
+func (w *world) aK8sCertificateSigningRequestNamedWithPrefixIsCreated(prefix string) error {
+	if w.createdK8sCSRName == "" {
+		return fmt.Errorf("no K8s CertificateSigningRequest was created by the issuer")
+	}
+	if !strings.HasPrefix(w.createdK8sCSRName, prefix) {
+		return fmt.Errorf("K8s CSR name %q does not have prefix %q", w.createdK8sCSRName, prefix)
+	}
+	// Verify it exists in the fake K8s API.
+	_, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.createdK8sCSRName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("K8s CSR %q not found in API: %w", w.createdK8sCSRName, err)
+	}
+	return nil
+}
+
+// theK8sCSRHasSignerName asserts the K8s CSR was created with the given signerName.
+func (w *world) theK8sCSRHasSignerName(expected string) error {
+	if w.createdK8sCSRName == "" {
+		return fmt.Errorf("no K8s CSR was created")
+	}
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.createdK8sCSRName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if csr.Spec.SignerName != expected {
+		return fmt.Errorf("K8s CSR signerName = %q, want %q", csr.Spec.SignerName, expected)
+	}
+	return nil
+}
+
+// theK8sCSRIsApproved asserts the K8s CSR has an Approved condition.
+func (w *world) theK8sCSRIsApproved() error {
+	if w.createdK8sCSRName == "" {
+		return fmt.Errorf("no K8s CSR was created")
+	}
+	csr, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().Get(
+		context.Background(), w.createdK8sCSRName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	for _, c := range csr.Status.Conditions {
+		if c.Type == certificatesv1.CertificateApproved && c.Status == corev1.ConditionTrue {
+			return nil
+		}
+	}
+	return fmt.Errorf("K8s CSR %q is not approved (conditions: %v)", w.createdK8sCSRName, csr.Status.Conditions)
+}
+
+// noK8sCertificateSigningRequestIsCreated asserts no K8s CSR was created.
+func (w *world) noK8sCertificateSigningRequestIsCreated() error {
+	if w.createdK8sCSRName != "" {
+		return fmt.Errorf("expected no K8s CSR to be created, but got %q", w.createdK8sCSRName)
+	}
+	return nil
+}
+
+// theCertificateRequestStatusCertificateIsSet asserts status.certificate is set.
+func (w *world) theCertificateRequestStatusCertificateIsSet() error {
+	cr := w.certRequests[w.lastCRNamespace+"/"+w.lastCRName]
+	if cr == nil {
+		return fmt.Errorf("no CertificateRequest %s/%s", w.lastCRNamespace, w.lastCRName)
+	}
+	cert, _, _ := unstructured.NestedString(cr.Object, "status", "certificate")
+	if cert == "" {
+		return fmt.Errorf("CertificateRequest %s/%s status.certificate is not set", w.lastCRNamespace, w.lastCRName)
+	}
+	return nil
+}
+
+// theCertificateRequestStatusCertificateIsNotSet asserts status.certificate is NOT set.
+func (w *world) theCertificateRequestStatusCertificateIsNotSet() error {
+	cr := w.certRequests[w.lastCRNamespace+"/"+w.lastCRName]
+	if cr == nil {
+		return fmt.Errorf("no CertificateRequest %s/%s", w.lastCRNamespace, w.lastCRName)
+	}
+	cert, _, _ := unstructured.NestedString(cr.Object, "status", "certificate")
+	if cert != "" {
+		return fmt.Errorf("CertificateRequest %s/%s status.certificate is set (should not be)", w.lastCRNamespace, w.lastCRName)
+	}
+	return nil
+}
+
+// theCertificateRequestHasConditionWithStatus asserts a condition on the CR.
+func (w *world) theCertificateRequestHasConditionWithStatus(condType, status string) error {
+	cr := w.certRequests[w.lastCRNamespace+"/"+w.lastCRName]
+	if cr == nil {
+		return fmt.Errorf("no CertificateRequest %s/%s", w.lastCRNamespace, w.lastCRName)
+	}
+	conditions, _, _ := unstructured.NestedSlice(cr.Object, "status", "conditions")
+	for _, raw := range conditions {
+		c, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if c["type"] == condType && c["status"] == status {
+			return nil
+		}
+	}
+	return fmt.Errorf("CertificateRequest %s/%s missing condition %q=%q (got: %v)",
+		w.lastCRNamespace, w.lastCRName, condType, status, conditions)
+}
+
 // ---- godog wiring ----
 
 func InitializeScenario(ctx *godog.ScenarioContext) {
@@ -742,6 +1681,51 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the proactive renewal check runs with window (\d+) seconds at wall time (\d+)$`, w.theProactiveRenewalCheckRunsWithWindowSecondsAtWallTime)
 	ctx.Step(`^the AVX renewal API was called for "([^"]+)"$`, w.theAVXRenewalAPIWasCalledFor)
 	ctx.Step(`^the AVX renewal API was not called$`, w.theAVXRenewalAPIWasNotCalled)
+
+	// K8s Secret writer.
+	ctx.Step(`^a K8s secret writer with namespace "([^"]+)" and prefix "([^"]+)"$`, w.aK8sSecretWriterWithNamespaceAndPrefix)
+	ctx.Step(`^the secret writer syncs against the cert store$`, w.theSecretWriterSyncsAgainstTheCertStore)
+	ctx.Step(`^a K8s Secret named "([^"]+)" exists in namespace "([^"]+)"$`, w.aK8sSecretNamedExistsInNamespace)
+	ctx.Step(`^no K8s Secret named "([^"]+)" exists in namespace "([^"]+)"$`, w.noK8sSecretNamedExistsInNamespace)
+	ctx.Step(`^the Secret type is Opaque$`, w.theSecretTypeIsOpaque)
+	ctx.Step(`^the Secret contains a "([^"]+)" entry$`, w.theSecretContainsAEntry)
+	ctx.Step(`^the Secret label "([^"]+)" equals "([^"]+)"$`, w.theSecretLabelEquals)
+	ctx.Step(`^I publish a renewed certificate with CN "([^"]+)" valid from (\d+) to (\d+) at block time (\d+)$`, w.iPublishARenewedCertificateWithCNValidFromToAtBlockTime)
+	ctx.Step(`^the old certificate is replaced$`, w.theOldCertificateIsReplaced)
+	ctx.Step(`^the Secret label "certchain\.io/cert-id" matches the new certificate$`, w.theSecretLabelMatchesTheNewCertificate)
+	ctx.Step(`^a certificate record for "([^"]+)" with status "([^"]+)" but no DER on disk$`, w.aCertificateRecordWithStatusButNoDEROnDisk)
+	ctx.Step(`^no error is returned$`, w.noErrorIsReturned)
+	ctx.Step(`^K8s Secret writes are forbidden by RBAC$`, w.k8sSecretWritesAreForbiddenByRBAC)
+
+	// K8s CSR watcher.
+	ctx.Step(`^AppViewX accepts CSR submissions$`, w.appViewXAcceptsCSRSubmissions)
+	ctx.Step(`^a K8s CSR watcher with signer name "([^"]+)"$`, w.aK8sCSRWatcherWithSignerName)
+	ctx.Step(`^a CertificateSigningRequest "([^"]+)" with signer "([^"]+)" is approved$`, w.aCertificateSigningRequestWithSignerIsApproved)
+	ctx.Step(`^the annotation "([^"]+)" is already set on the CSR$`, w.theAnnotationIsAlreadySetOnTheCSR)
+	ctx.Step(`^AppViewX eventually issues the certificate$`, w.appViewXEventuallyIssuesTheCertificate)
+	ctx.Step(`^AppViewX rejects all CSR submissions$`, w.appViewXRejectsAllCSRSubmissions)
+	ctx.Step(`^the CSR watcher processes the event$`, w.theCSRWatcherProcessesTheEvent)
+	ctx.Step(`^a TxCertRequest is submitted to the chain with CN "([^"]+)"$`, w.aTxCertRequestIsSubmittedToTheChainWithCN)
+	ctx.Step(`^no TxCertRequest is submitted to the chain$`, w.noTxCertRequestIsSubmittedToTheChain)
+	ctx.Step(`^the CSR annotation "([^"]+)" is set$`, w.theCSRAnnotationIsSet)
+	ctx.Step(`^the CSR status\.certificate field is set$`, w.theCSRStatusCertificateFieldIsSet)
+	ctx.Step(`^the CSR has a "([^"]+)" condition$`, w.theCSRHasACondition)
+
+	// certchain-issuer external issuer.
+	ctx.Step(`^a CertchainClusterIssuer named "([^"]+)" with signerName "([^"]+)"$`, w.aCertchainClusterIssuerNamedWithSignerName)
+	ctx.Step(`^a certchain-issuer controller watching CertificateRequests$`, w.aCertchainIssuerControllerWatchingCertificateRequests)
+	ctx.Step(`^a cert-manager CertificateRequest "([^"]+)" in namespace "([^"]+)" with issuerRef group "([^"]+)" kind "([^"]+)" name "([^"]+)" and CN "([^"]+)"$`, w.aCertManagerCertificateRequest)
+	ctx.Step(`^the CertificateRequest already has status\.certificate set$`, w.theCertificateRequestAlreadyHasStatusCertificateSet)
+	ctx.Step(`^the K8s CertificateSigningRequest status\.certificate is pre-populated$`, w.theK8sCSRStatusCertificateIsPrePopulated)
+	ctx.Step(`^the certchain-issuer cert wait timeout is (\d+) milliseconds$`, w.theIssuerCertWaitTimeoutIs)
+	ctx.Step(`^the certchain-issuer processes the CertificateRequest$`, w.theIssuerProcessesTheCertificateRequest)
+	ctx.Step(`^a K8s CertificateSigningRequest named with prefix "([^"]+)" is created$`, w.aK8sCertificateSigningRequestNamedWithPrefixIsCreated)
+	ctx.Step(`^the K8s CSR has signerName "([^"]+)"$`, w.theK8sCSRHasSignerName)
+	ctx.Step(`^the K8s CSR is approved$`, w.theK8sCSRIsApproved)
+	ctx.Step(`^no K8s CertificateSigningRequest is created$`, w.noK8sCertificateSigningRequestIsCreated)
+	ctx.Step(`^the CertificateRequest status\.certificate is set$`, w.theCertificateRequestStatusCertificateIsSet)
+	ctx.Step(`^the CertificateRequest status\.certificate is not set$`, w.theCertificateRequestStatusCertificateIsNotSet)
+	ctx.Step(`^the CertificateRequest has condition "([^"]+)" with status "([^"]+)"$`, w.theCertificateRequestHasConditionWithStatus)
 }
 
 func TestBDD(t *testing.T) {

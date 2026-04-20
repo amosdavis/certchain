@@ -13,9 +13,10 @@ import (
 type TxType byte
 
 const (
-	TxCertPublish TxType = 0x01 // publish cert hash + metadata
-	TxCertRevoke  TxType = 0x02 // revoke a certificate (AVX-driven)
-	TxCertRenew   TxType = 0x03 // replace old cert_id with new cert_id
+	TxCertPublish  TxType = 0x01 // publish cert hash + metadata
+	TxCertRevoke   TxType = 0x02 // revoke a certificate (AVX-driven)
+	TxCertRenew    TxType = 0x03 // replace old cert_id with new cert_id
+	TxCertRequest  TxType = 0x04 // immutable audit record of a K8s CSR submission to AVX
 )
 
 // Block is a single certchain block.
@@ -41,13 +42,19 @@ type Transaction struct {
 
 // CertPublishPayload is the JSON payload for TxCertPublish.
 type CertPublishPayload struct {
-	CertID    [32]byte `json:"cert_id"`
-	CN        string   `json:"cn"`
-	AVXCertID string   `json:"avx_cert_id"`
-	NotBefore int64    `json:"not_before"`
-	NotAfter  int64    `json:"not_after"`
-	SANs      []string `json:"sans"`
-	Serial    string   `json:"serial"`
+	CertID       [32]byte `json:"cert_id"`
+	CN           string   `json:"cn"`
+	AVXCertID    string   `json:"avx_cert_id"`
+	NotBefore    int64    `json:"not_before"`
+	NotAfter     int64    `json:"not_after"`
+	SANs         []string `json:"sans"`
+	Serial       string   `json:"serial"`
+	IssuerDN     string   `json:"issuer_dn,omitempty"`
+	KeyAlgorithm string   `json:"key_algorithm,omitempty"`
+	Template     string   `json:"template,omitempty"`
+	Requester    string   `json:"requester,omitempty"`
+	KeyVaultRef  string   `json:"key_vault_ref,omitempty"`
+	Environments []string `json:"environments,omitempty"`
 }
 
 // CertRevokePayload is the JSON payload for TxCertRevoke.
@@ -61,6 +68,17 @@ type CertRevokePayload struct {
 type CertRenewPayload struct {
 	OldCertID [32]byte `json:"old_cert_id"`
 	NewCertID [32]byte `json:"new_cert_id"`
+}
+
+// CertRequestPayload is the JSON payload for TxCertRequest.
+// It is an immutable on-chain audit record written when a Kubernetes
+// CertificateSigningRequest is submitted to AppViewX.
+// AVX request ID and issuance status are tracked off-chain to preserve
+// payload immutability.
+type CertRequestPayload struct {
+	CSRHash [32]byte `json:"csr_hash"` // SHA-256 of the PKCS#10 DER bytes
+	CN      string   `json:"cn"`
+	SANs    []string `json:"sans"`
 }
 
 // ---- Hashing ----
@@ -139,6 +157,11 @@ func MarshalRenew(p *CertRenewPayload) (json.RawMessage, error) {
 	return json.Marshal(p)
 }
 
+// MarshalCertRequest encodes a CertRequestPayload as JSON.
+func MarshalCertRequest(p *CertRequestPayload) (json.RawMessage, error) {
+	return json.Marshal(p)
+}
+
 // UnmarshalPublish decodes a CertPublishPayload from a transaction payload.
 func UnmarshalPublish(tx *Transaction) (*CertPublishPayload, error) {
 	if tx.Type != TxCertPublish {
@@ -169,6 +192,18 @@ func UnmarshalRenew(tx *Transaction) (*CertRenewPayload, error) {
 		return nil, errors.New("not a CertRenew transaction")
 	}
 	var p CertRenewPayload
+	if err := json.Unmarshal(tx.Payload, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// UnmarshalCertRequest decodes a CertRequestPayload from a transaction payload.
+func UnmarshalCertRequest(tx *Transaction) (*CertRequestPayload, error) {
+	if tx.Type != TxCertRequest {
+		return nil, errors.New("not a CertRequest transaction")
+	}
+	var p CertRequestPayload
 	if err := json.Unmarshal(tx.Payload, &p); err != nil {
 		return nil, err
 	}

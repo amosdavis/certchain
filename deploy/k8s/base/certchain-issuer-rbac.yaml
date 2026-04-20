@@ -1,0 +1,58 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: certchain-issuer
+  namespace: certchain
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: certchain-issuer
+rules:
+# cert-manager CertificateRequest management
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificaterequests"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["cert-manager.io"]
+  resources: ["certificaterequests/status"]
+  verbs: ["update", "patch"]
+# K8s CSR creation, approval, and status reading
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests"]
+  verbs: ["get", "create", "list", "watch"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/approval"]
+  verbs: ["update"]
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/status"]
+  verbs: ["get"]
+# Approve K8s CSRs (signer approval permission)
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["signers"]
+  resourceNames: ["certchain.io/appviewx"]
+  verbs: ["approve"]
+# certchain CRD (Issuer types) — read + update status
+- apiGroups: ["certchain.io"]
+  resources: ["certchainclusterissuers", "certchainissuers"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: ["certchain.io"]
+  resources: ["certchainclusterissuers/status", "certchainissuers/status"]
+  verbs: ["update", "patch"]
+# Lease for leader election
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: certchain-issuer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: certchain-issuer
+subjects:
+- kind: ServiceAccount
+  name: certchain-issuer
+  namespace: certchain

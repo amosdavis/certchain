@@ -1,0 +1,127 @@
+---
+# CertchainClusterIssuer — cluster-scoped issuer resource.
+# Cert-manager CertificateRequest objects that reference this via
+# issuerRef.kind=CertchainClusterIssuer and issuerRef.group=certchain.io
+# will be fulfilled by the certchain-issuer controller.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: certchainclusterissuers.certchain.io
+spec:
+  group: certchain.io
+  names:
+    kind: CertchainClusterIssuer
+    listKind: CertchainClusterIssuerList
+    plural: certchainclusterissuers
+    singular: certchainclusterissuer
+    shortNames: ["ccli"]
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              signerName:
+                type: string
+                description: >
+                  The K8s CertificateSigningRequest signerName certchain-issuer
+                  will use. Must match the --k8s-signer-name flag on certd.
+                  Defaults to "certchain.io/appviewx" if omitted.
+                default: "certchain.io/appviewx"
+          status:
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: [type, status]
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - name: Ready
+      type: string
+      jsonPath: .status.conditions[?(@.type=="Ready")].status
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+---
+# CertchainIssuer — namespace-scoped issuer resource.
+# Use when you want to restrict issuance to a specific namespace.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: certchainissuers.certchain.io
+spec:
+  group: certchain.io
+  names:
+    kind: CertchainIssuer
+    listKind: CertchainIssuerList
+    plural: certchainissuers
+    singular: certchainissuer
+    shortNames: ["cci"]
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              signerName:
+                type: string
+                description: >
+                  The K8s CertificateSigningRequest signerName certchain-issuer
+                  will use. Defaults to "certchain.io/appviewx" if omitted.
+                default: "certchain.io/appviewx"
+          status:
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required: [type, status]
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - name: Ready
+      type: string
+      jsonPath: .status.conditions[?(@.type=="Ready")].status
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp

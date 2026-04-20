@@ -33,6 +33,8 @@ func ValidatePayload(tx *Transaction) error {
 		return validateRevoke(tx)
 	case TxCertRenew:
 		return validateRenew(tx)
+	case TxCertRequest:
+		return validateCertRequest(tx)
 	default:
 		return errors.New("unknown transaction type")
 	}
@@ -108,4 +110,21 @@ func isZero(b [32]byte) bool {
 		}
 	}
 	return true
+}
+
+func validateCertRequest(tx *Transaction) error {
+	p, err := UnmarshalCertRequest(tx)
+	if err != nil {
+		return err
+	}
+	if isZero(p.CSRHash) {
+		return errors.New("csr_hash must not be zero")
+	}
+	if p.CN == "" {
+		return errors.New("cn must not be empty")
+	}
+	if len(p.SANs) > 16 {
+		return errors.New("too many SANs (max 16)")
+	}
+	return nil
 }

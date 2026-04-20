@@ -49,6 +49,30 @@ spec:
               name: certchain-avx
               key: AVX_KEY
               optional: true
+        - name: K8S_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: K8S_ENABLED
+              optional: true
+        - name: K8S_NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: K8S_NAMESPACE
+              optional: true
+        - name: K8S_SECRET_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: K8S_SECRET_PREFIX
+              optional: true
+        - name: K8S_SIGNER_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: certchain-config
+              key: K8S_SIGNER_NAME
+              optional: true
         ports:
         - name: query
           containerPort: 9879

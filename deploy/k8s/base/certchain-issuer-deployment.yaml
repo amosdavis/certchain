@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: certchain-issuer
+  namespace: certchain
+  labels:
+    app: certchain-issuer
+spec:
+  # Two replicas for HA (CM-20, CM-21). Leader election ensures only one
+  # replica processes CertificateRequests at a time.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: certchain-issuer
+  template:
+    metadata:
+      labels:
+        app: certchain-issuer
+    spec:
+      serviceAccountName: certchain-issuer
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+      - name: certchain-issuer
+        image: your-registry/certchain-issuer:latest
+        args:
+        - "--health-addr=:8081"
+        - "--reconnect-delay=5s"
+        ports:
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "10m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"

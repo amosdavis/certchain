@@ -12,7 +12,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,21 +34,31 @@ import (
 	"github.com/amosdavis/certchain/internal/cert"
 	"github.com/amosdavis/certchain/internal/chain"
 	"github.com/amosdavis/certchain/internal/crypto"
-	"github.com/amosdavis/certchain/internal/csr"
+	certk8s "github.com/amosdavis/certchain/internal/k8s"
 	"github.com/amosdavis/certchain/internal/peer"
 	"github.com/amosdavis/certchain/internal/query"
 )
 
+// keyVaultEntry is one entry in the --key-vault-map JSON file.
+type keyVaultEntry struct {
+	KeyVaultRef  string   `json:"key_vault_ref"`
+	Environments []string `json:"environments"`
+}
+
 func main() {
-	configDir := flag.String("config", defaultConfigDir(), "config directory")
-	avxURL := flag.String("avx-url", "", "AppViewX base URL (e.g. https://avx.example.com)")
-	avxKey := flag.String("avx-key", "", "AppViewX API key")
-	queryAddr := flag.String("query-addr", ":9879", "HTTP query API listen address")
-	maxCerts := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
-	renewWindow := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
-	notifyURL   := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
-	staticPeers := flag.String("static-peers", "", "comma-separated host:port peers for cross-cluster sync")
-	csrDomains  := flag.String("csr-domains", "", "path to JSON file listing CNs/SANs to auto-request from AVX")
+	configDir       := flag.String("config", defaultConfigDir(), "config directory")
+	avxURL          := flag.String("avx-url", "", "AppViewX base URL (e.g. https://avx.example.com)")
+	avxKey          := flag.String("avx-key", "", "AppViewX API key")
+	queryAddr       := flag.String("query-addr", ":9879", "HTTP query API listen address")
+	maxCerts        := flag.Int("max-certs", 0, "maximum cert records (0=unlimited)")
+	renewWindow     := flag.Duration("renew-window", 30*24*time.Hour, "trigger AVX proactive renewal this far before cert expiry (0=disabled)")
+	notifyURL       := flag.String("notify-url", "", "webhook URL to POST on cert renewal or revocation")
+	staticPeers     := flag.String("static-peers", "", "comma-separated host:port peers for cross-cluster sync")
+	keyVaultMap     := flag.String("key-vault-map", "", "path to JSON file mapping CNs to key vault URIs and environments")
+	k8sEnabled      := flag.Bool("k8s-enabled", false, "enable Kubernetes Secret and CSR integration")
+	k8sNamespace    := flag.String("k8s-namespace", "", "Kubernetes namespace for Secrets (default: certchain)")
+	k8sSecretPrefix := flag.String("k8s-secret-prefix", "", "prefix for K8s Secret names (default: cc)")
+	k8sSignerName   := flag.String("k8s-signer-name", "", "CSR signerName to watch (default: certchain.io/appviewx)")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -53,6 +67,17 @@ func main() {
 	if *avxKey == ""      { *avxKey = os.Getenv("AVX_KEY") }
 	if *notifyURL == ""   { *notifyURL = os.Getenv("NOTIFY_URL") }
 	if *staticPeers == "" { *staticPeers = os.Getenv("STATIC_PEERS") }
+	if !*k8sEnabled {
+		v := os.Getenv("K8S_ENABLED")
+		*k8sEnabled = v == "true" || v == "1"
+	}
+	if *k8sNamespace == ""    { *k8sNamespace = os.Getenv("K8S_NAMESPACE") }
+	if *k8sSecretPrefix == "" { *k8sSecretPrefix = os.Getenv("K8S_SECRET_PREFIX") }
+	if *k8sSignerName == ""   { *k8sSignerName = os.Getenv("K8S_SIGNER_NAME") }
+	// Apply built-in defaults after env-var resolution.
+	if *k8sNamespace == ""    { *k8sNamespace = "certchain" }
+	if *k8sSecretPrefix == "" { *k8sSecretPrefix = "cc" }
+	if *k8sSignerName == ""   { *k8sSignerName = "certchain.io/appviewx" }
 
 	id, err := crypto.LoadOrCreate(*configDir)
 	if err != nil {
@@ -82,8 +107,70 @@ func main() {
 	}
 	defer discoverer.Stop()
 
-	// Block sync.
+	// Block sync — OnNewBlocks is set after K8s wiring so triggerK8sSync is ready.
 	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey, *configDir)
+
+	// blockSubmitter serialises all block submissions (avxPollLoop + CSRWatcher)
+	// behind a single mutex so the per-node nonce stays monotonically increasing.
+	bs := newBlockSubmitter(ch, certStore, id, syncer, *configDir)
+
+	// AppViewX client — shared between poll loop and K8s CSR watcher.
+	var avxClient *avx.Client
+	if *avxURL != "" {
+		avxClient = avx.NewClient(avx.Config{
+			BaseURL: *avxURL,
+			APIKey:  *avxKey,
+		})
+	} else {
+		log.Printf("certd: no --avx-url set; AVX polling disabled")
+	}
+
+	// Kubernetes integration (CM-16–CM-19).
+	// triggerK8sSync is a no-op until K8s is enabled; syncer.OnNewBlocks calls
+	// it so it must be defined before the callback is assigned.
+	triggerK8sSync := func() {}
+	if *k8sEnabled {
+		k8sClient, err := certk8s.NewInClusterClient()
+		if err != nil {
+			log.Fatalf("certd: k8s in-cluster config: %v", err)
+		}
+		sw := certk8s.NewSecretWriter(k8sClient, *k8sNamespace, *k8sSecretPrefix)
+
+		// Dedicate one goroutine to SecretWriter syncs; a buffered channel
+		// prevents duplicate queued syncs without blocking the caller.
+		k8sSyncTrigger := make(chan struct{}, 1)
+		go func() {
+			for range k8sSyncTrigger {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if err := sw.Sync(ctx, certStore.List(false), *configDir); err != nil {
+					log.Printf("certd: k8s secret sync: %v", err)
+				}
+				cancel()
+			}
+		}()
+		triggerK8sSync = func() {
+			select {
+			case k8sSyncTrigger <- struct{}{}:
+			default: // a sync is already queued; skip
+			}
+		}
+
+		// CSR watcher requires AVX to submit certificates.
+		if avxClient != nil {
+			cw := certk8s.NewCSRWatcher(k8sClient, avxClient, id, *k8sSignerName, bs.Submit)
+			cw.Start()
+			defer cw.Stop()
+		} else {
+			log.Printf("certd: K8s CSR watching disabled (--avx-url not set)")
+		}
+
+		// Trigger an initial sync so existing secrets are up-to-date at start-up.
+		triggerK8sSync()
+
+		// Drain the trigger channel on shutdown so the sync goroutine exits cleanly.
+		defer close(k8sSyncTrigger)
+	}
+
 	syncer.OnNewBlocks = func(candidate []chain.Block) {
 		replaced, err := ch.Replace(candidate)
 		if err != nil {
@@ -98,6 +185,7 @@ func main() {
 			if err := saveChain(ch, *configDir); err != nil {
 				log.Printf("certd: save chain: %v", err)
 			}
+			triggerK8sSync()
 		}
 	}
 	if err := syncer.Start(); err != nil {
@@ -123,11 +211,7 @@ func main() {
 	}()
 
 	// AppViewX polling loop.
-	if *avxURL != "" {
-		avxClient := avx.NewClient(avx.Config{
-			BaseURL: *avxURL,
-			APIKey:  *avxKey,
-		})
+	if avxClient != nil {
 		go func() {
 			// Give UDP discovery time to find peers, then sync before polling AVX.
 			// This prevents re-publishing certs already on chain after a restart.
@@ -138,10 +222,8 @@ func main() {
 			for _, rec := range certStore.List(false) {
 				avxClient.MarkPublished(rec.AVXCertID)
 			}
-			avxPollLoop(avxClient, ch, certStore, id, syncer, *configDir, *renewWindow, *notifyURL, *csrDomains)
+			avxPollLoop(avxClient, bs, *configDir, *renewWindow, *notifyURL, *keyVaultMap, triggerK8sSync)
 		}()
-	} else {
-		log.Printf("certd: no --avx-url set; AVX polling disabled")
 	}
 
 	// Wait for shutdown signal.
@@ -159,28 +241,79 @@ func main() {
 	}
 }
 
+// blockSubmitter serialises block submissions from concurrent goroutines
+// (avxPollLoop and CSRWatcher) behind a single mutex so the per-node nonce
+// stays monotonically increasing.
+type blockSubmitter struct {
+	mu        sync.Mutex
+	nonce     uint32
+	ch        *chain.Chain
+	id        *crypto.Identity
+	certStore *cert.Store
+	syncer    *peer.Syncer
+	configDir string
+}
+
+func newBlockSubmitter(ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string) *blockSubmitter {
+	bs := &blockSubmitter{
+		ch: ch, certStore: certStore, id: id, syncer: syncer, configDir: configDir,
+	}
+	// Resume nonce from chain to avoid replay (monotonic per-node).
+	for _, blk := range ch.GetBlocks() {
+		for _, tx := range blk.Txs {
+			if tx.NodePubkey == id.PublicKey && tx.Nonce > bs.nonce {
+				bs.nonce = tx.Nonce
+			}
+		}
+	}
+	return bs
+}
+
+// Submit adds a transaction to the chain. tx must have Type and Payload set;
+// NodePubkey, Timestamp, Nonce, and Signature are assigned under the mutex,
+// preventing duplicate nonces when multiple goroutines submit concurrently.
+func (bs *blockSubmitter) Submit(tx chain.Transaction) error {
+	bs.mu.Lock()
+	bs.nonce++
+	tx.Nonce = bs.nonce
+	tx.NodePubkey = bs.id.PublicKey
+	tx.Timestamp = chain.Now()
+	chain.Sign(&tx, bs.id)
+
+	tip := bs.ch.Tip()
+	blk := chain.Block{
+		Index:     tip.Index + 1,
+		Timestamp: chain.Now(),
+		PrevHash:  tip.Hash,
+		Txs:       []chain.Transaction{tx},
+	}
+	blk.Hash = chain.ComputeHash(&blk)
+
+	addErr := bs.ch.AddBlock(blk)
+	if addErr != nil {
+		bs.nonce--
+	}
+	bs.mu.Unlock()
+
+	if addErr != nil {
+		return addErr
+	}
+	if err := bs.certStore.ApplyBlock(blk); err != nil {
+		log.Printf("certd: cert store apply block: %v", err)
+	}
+	bs.syncer.PushBlockToPeers(blk)
+	_ = saveChain(bs.ch, bs.configDir)
+	return nil
+}
+
 // avxPollLoop polls AppViewX and publishes new/revoked/renewed certs to the chain.
 // It also enforces certificate expiry (CM-02): any active cert whose not_after
 // has passed is auto-revoked via TxCertRevoke.
 // When renewWindow > 0, it proactively calls the AVX renewal API for certs
 // approaching expiry so that AVX issues a replacement before the cert expires.
-func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, renewWindow time.Duration, notifyURL string, csrDomainsFile string) {
-	var nonce uint32
-	// Resume nonce from chain to avoid replay (monotonic per-node).
-	for _, blk := range ch.GetBlocks() {
-		for _, tx := range blk.Txs {
-			if tx.NodePubkey == id.PublicKey && tx.Nonce > nonce {
-				nonce = tx.Nonce
-			}
-		}
-	}
-
-	// CSR store tracks submitted CSRs and associates private keys with issued certs.
-	csrStore, err := csr.NewStore(configDir)
-	if err != nil {
-		log.Printf("certd: csr store init: %v (CSR generation disabled)", err)
-		csrStore = nil
-	}
+// onPollDone is called after each successful poll cycle (used to trigger K8s sync).
+func avxPollLoop(client *avx.Client, bs *blockSubmitter, configDir string, renewWindow time.Duration, notifyURL string, keyVaultMapFile string, onPollDone func()) {
+	kvMap := loadKeyVaultMap(keyVaultMapFile)
 
 	const (
 		backoffBase = 5 * time.Second
@@ -192,6 +325,11 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 	for {
 		if nextSleep > 0 {
 			time.Sleep(nextSleep)
+		}
+
+		// Reload key vault map each cycle so file edits take effect without restart.
+		if keyVaultMapFile != "" {
+			kvMap = loadKeyVaultMap(keyVaultMapFile)
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -225,59 +363,37 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 
 		for _, c := range result.NewCerts {
 			// Check if this is a renewal: same CN already has an active cert.
-			oldRec, isRenewal := certStore.GetByCN(c.CommonName)
+			oldRec, isRenewal := bs.certStore.GetByCN(c.CommonName)
 
-			nonce++
-			blk, certID, err := buildPublishBlock(ch, id, nonce, c, configDir, client)
+			payload, certID, err := buildPublishPayload(c, configDir, client, kvMap)
 			if err != nil {
-				log.Printf("certd: build publish block for %s: %v", c.CommonName, err)
-				nonce--
+				log.Printf("certd: build publish payload for %s: %v", c.CommonName, err)
 				continue
 			}
-			if err := ch.AddBlock(blk); err != nil {
-				log.Printf("certd: add publish block for %s: %v", c.CommonName, err)
-				nonce--
+			if err := bs.Submit(chain.Transaction{Type: chain.TxCertPublish, Payload: payload}); err != nil {
+				log.Printf("certd: submit publish for %s: %v", c.CommonName, err)
 				continue
-			}
-			if err := certStore.ApplyBlock(blk); err != nil {
-				log.Printf("certd: cert store apply publish: %v", err)
 			}
 			client.MarkPublished(c.AVXCertID)
-			syncer.PushBlockToPeers(blk)
-			_ = saveChain(ch, configDir)
-
-			// If a CSR was submitted for this CN, link the private key to cert_id.
-			if csrStore != nil {
-				certIDHex := fmt.Sprintf("%x", certID)
-				keyDir := filepath.Join(configDir, "keys")
-				if _, linkErr := csrStore.LinkCert(c.CommonName, certIDHex, keyDir); linkErr != nil {
-					log.Printf("certd: link CSR key for %s: %v", c.CommonName, linkErr)
-				}
-			}
 
 			// If this is a renewal, emit TxCertRenew linking old → new cert_id.
 			// TxCertRenew sets the old cert's status to "replaced", so no separate
 			// TxCertRevoke is needed for the old cert.
 			if isRenewal {
-				nonce++
-				renewBlk, err := buildRenewBlock(ch, id, nonce, oldRec.CertID, certID)
+				renewPayload, err := chain.MarshalRenew(&chain.CertRenewPayload{
+					OldCertID: oldRec.CertID,
+					NewCertID: certID,
+				})
 				if err != nil {
-					log.Printf("certd: build renew block for %s: %v", c.CommonName, err)
-					nonce--
+					log.Printf("certd: marshal renew for %s: %v", c.CommonName, err)
 					continue
 				}
-				if err := ch.AddBlock(renewBlk); err != nil {
-					log.Printf("certd: add renew block for %s: %v", c.CommonName, err)
-					nonce--
+				if err := bs.Submit(chain.Transaction{Type: chain.TxCertRenew, Payload: renewPayload}); err != nil {
+					log.Printf("certd: submit renew for %s: %v", c.CommonName, err)
 					continue
-				}
-				if err := certStore.ApplyBlock(renewBlk); err != nil {
-					log.Printf("certd: cert store apply renew: %v", err)
 				}
 				client.MarkUnpublished(oldRec.AVXCertID)
 				renewedOldAVXIDs[oldRec.AVXCertID] = struct{}{}
-				syncer.PushBlockToPeers(renewBlk)
-				_ = saveChain(ch, configDir)
 				if notifyURL != "" {
 					go notifyCertEvent(notifyURL, "renewed", c.CommonName,
 						fmt.Sprintf("%x", oldRec.CertID), fmt.Sprintf("%x", certID))
@@ -290,31 +406,27 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			if _, skip := renewedOldAVXIDs[c.AVXCertID]; skip {
 				continue
 			}
-			certID := certIDFromAVX(certStore, c.AVXCertID)
+			certID := certIDFromAVX(bs.certStore, c.AVXCertID)
 			if certID == nil {
 				continue
 			}
 			var revokeCN string
-			if rec, ok := certStore.GetByID(*certID); ok {
+			if rec, ok := bs.certStore.GetByID(*certID); ok {
 				revokeCN = rec.CN
 			}
-			nonce++
-			blk, err := buildRevokeBlock(ch, id, nonce, *certID)
+			revokePayload, err := chain.MarshalRevoke(&chain.CertRevokePayload{
+				CertID:    *certID,
+				Reason:    0,
+				RevokedAt: chain.Now(),
+			})
 			if err != nil {
-				log.Printf("certd: build revoke block: %v", err)
-				nonce--
+				log.Printf("certd: marshal revoke: %v", err)
 				continue
 			}
-			if err := ch.AddBlock(blk); err != nil {
-				log.Printf("certd: add revoke block: %v", err)
-				nonce--
+			if err := bs.Submit(chain.Transaction{Type: chain.TxCertRevoke, Payload: revokePayload}); err != nil {
+				log.Printf("certd: submit revoke: %v", err)
 				continue
 			}
-			if err := certStore.ApplyBlock(blk); err != nil {
-				log.Printf("certd: cert store apply revoke: %v", err)
-			}
-			syncer.PushBlockToPeers(blk)
-			_ = saveChain(ch, configDir)
 			if notifyURL != "" {
 				go notifyCertEvent(notifyURL, "revoked", revokeCN,
 					fmt.Sprintf("%x", *certID), "")
@@ -325,27 +437,23 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 		// This is the local expiry enforcement fallback for when AVX is slow or
 		// silent about an expiry.
 		now := time.Now().Unix()
-		for _, rec := range certStore.List(true) {
+		for _, rec := range bs.certStore.List(true) {
 			if rec.NotAfter > now {
 				continue
 			}
-			nonce++
-			blk, err := buildRevokeBlock(ch, id, nonce, rec.CertID)
+			revokePayload, err := chain.MarshalRevoke(&chain.CertRevokePayload{
+				CertID:    rec.CertID,
+				Reason:    0,
+				RevokedAt: chain.Now(),
+			})
 			if err != nil {
-				log.Printf("certd: build expiry revoke for %s: %v", rec.CN, err)
-				nonce--
+				log.Printf("certd: marshal expiry revoke for %s: %v", rec.CN, err)
 				continue
 			}
-			if err := ch.AddBlock(blk); err != nil {
-				log.Printf("certd: add expiry revoke for %s: %v", rec.CN, err)
-				nonce--
+			if err := bs.Submit(chain.Transaction{Type: chain.TxCertRevoke, Payload: revokePayload}); err != nil {
+				log.Printf("certd: submit expiry revoke for %s: %v", rec.CN, err)
 				continue
 			}
-			if err := certStore.ApplyBlock(blk); err != nil {
-				log.Printf("certd: cert store expiry revoke for %s: %v", rec.CN, err)
-			}
-			syncer.PushBlockToPeers(blk)
-			_ = saveChain(ch, configDir)
 			if notifyURL != "" {
 				go notifyCertEvent(notifyURL, "revoked", rec.CN,
 					fmt.Sprintf("%x", rec.CertID), "")
@@ -359,7 +467,7 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 		if renewWindow > 0 {
 			renewWindowSecs := int64(renewWindow.Seconds())
 			renewCutoff := now + renewWindowSecs
-			for _, rec := range certStore.List(true) {
+			for _, rec := range bs.certStore.List(true) {
 				if rec.NotAfter <= now || rec.NotAfter > renewCutoff {
 					continue // already expired or not yet within window
 				}
@@ -373,63 +481,18 @@ func avxPollLoop(client *avx.Client, ch *chain.Chain, certStore *cert.Store, id 
 			}
 		}
 
-		// CSR domain requests: for any domain listed in --csr-domains that has no
-		// active cert and no pending CSR, generate a key pair and submit to AVX.
-		if csrStore != nil && csrDomainsFile != "" {
-			submitPendingCSRs(client, certStore, csrStore, csrDomainsFile)
-		}
+		onPollDone()
 	}
 }
 
-// submitPendingCSRs reads the csr-domains file and submits a CSR to AVX for any
-// domain that has neither an active cert on chain nor a pending CSR already.
-func submitPendingCSRs(client *avx.Client, certStore *cert.Store, csrStore *csr.Store, domainsFile string) {
-	data, err := os.ReadFile(domainsFile)
-	if err != nil {
-		log.Printf("certd: read csr-domains: %v", err)
-		return
-	}
-	var domains []struct {
-		CN   string   `json:"cn"`
-		SANs []string `json:"sans"`
-	}
-	if err := json.Unmarshal(data, &domains); err != nil {
-		log.Printf("certd: parse csr-domains: %v", err)
-		return
-	}
-	for _, d := range domains {
-		if _, ok := certStore.GetByCN(d.CN); ok {
-			continue // already have an active cert
-		}
-		if csrStore.HasPending(d.CN) {
-			continue // CSR already submitted, waiting for issuance
-		}
-		keyPEM, csrPEM, err := csr.Generate(d.CN, d.SANs)
-		if err != nil {
-			log.Printf("certd: generate CSR for %s: %v", d.CN, err)
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		requestID, err := client.SubmitCSR(ctx, d.CN, d.SANs, csrPEM, 0)
-		cancel()
-		if err != nil {
-			log.Printf("certd: submit CSR for %s: %v", d.CN, err)
-			continue
-		}
-		if err := csrStore.Add(d.CN, d.SANs, requestID, keyPEM); err != nil {
-			log.Printf("certd: store CSR for %s: %v", d.CN, err)
-			continue
-		}
-		log.Printf("certd: submitted CSR for %s (avx_request_id=%s)", d.CN, requestID)
-	}
-}
-
-func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *avx.Cert, configDir string, client *avx.Client) (chain.Block, [32]byte, error) {
+// buildPublishPayload fetches the DER from AVX, caches it locally, and returns
+// the serialised TxCertPublish payload together with the cert's SHA-256 certID.
+func buildPublishPayload(c *avx.Cert, configDir string, client *avx.Client, kvMap map[string]keyVaultEntry) (json.RawMessage, [32]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	der, err := client.GetDER(ctx, c.AVXCertID)
 	cancel()
 	if err != nil {
-		return chain.Block{}, [32]byte{}, fmt.Errorf("get DER: %w", err)
+		return nil, [32]byte{}, fmt.Errorf("get DER: %w", err)
 	}
 
 	certID := sha256.Sum256(der)
@@ -441,96 +504,69 @@ func buildPublishBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, c *av
 		_ = os.WriteFile(filepath.Join(derDir, hexID+".der"), der, 0600)
 	}
 
+	// Parse DER to extract issuer and key algorithm metadata.
+	var issuerDN, keyAlg string
+	if parsed, parseErr := x509.ParseCertificate(der); parseErr == nil {
+		issuerDN = parsed.Issuer.String()
+		keyAlg = keyAlgorithmString(parsed.PublicKey)
+	}
+
+	// Look up key vault reference and environments for this CN.
+	var kvRef string
+	var envs []string
+	if entry, ok := kvMap[c.CommonName]; ok {
+		kvRef = entry.KeyVaultRef
+		envs = entry.Environments
+	}
+
 	payload, err := chain.MarshalPublish(&chain.CertPublishPayload{
-		CertID:    certID,
-		CN:        c.CommonName,
-		AVXCertID: c.AVXCertID,
-		NotBefore: c.NotBefore.Unix(),
-		NotAfter:  c.NotAfter.Unix(),
-		SANs:      c.SANs,
-		Serial:    c.Serial,
+		CertID:       certID,
+		CN:           c.CommonName,
+		AVXCertID:    c.AVXCertID,
+		NotBefore:    c.NotBefore.Unix(),
+		NotAfter:     c.NotAfter.Unix(),
+		SANs:         c.SANs,
+		Serial:       c.Serial,
+		IssuerDN:     issuerDN,
+		KeyAlgorithm: keyAlg,
+		Template:     c.Template,
+		Requester:    c.Requester,
+		KeyVaultRef:  kvRef,
+		Environments: envs,
 	})
 	if err != nil {
-		return chain.Block{}, [32]byte{}, err
+		return nil, [32]byte{}, err
 	}
-
-	tx := chain.Transaction{
-		Type:       chain.TxCertPublish,
-		NodePubkey: id.PublicKey,
-		Timestamp:  chain.Now(),
-		Nonce:      nonce,
-		Payload:    payload,
-	}
-	chain.Sign(&tx, id)
-
-	tip := ch.Tip()
-	blk := chain.Block{
-		Index:     tip.Index + 1,
-		Timestamp: chain.Now(),
-		PrevHash:  tip.Hash,
-		Txs:       []chain.Transaction{tx},
-	}
-	blk.Hash = chain.ComputeHash(&blk)
-	return blk, certID, nil
+	return payload, certID, nil
 }
 
-func buildRenewBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, oldCertID, newCertID [32]byte) (chain.Block, error) {
-	payload, err := chain.MarshalRenew(&chain.CertRenewPayload{
-		OldCertID: oldCertID,
-		NewCertID: newCertID,
-	})
-	if err != nil {
-		return chain.Block{}, err
+// keyAlgorithmString returns a human-readable algorithm+size string for a public key.
+func keyAlgorithmString(pub any) string {
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		return fmt.Sprintf("ECDSA-P%d", k.Curve.Params().BitSize)
+	case *rsa.PublicKey:
+		return fmt.Sprintf("RSA-%d", k.N.BitLen())
+	default:
+		return "unknown"
 	}
-
-	tx := chain.Transaction{
-		Type:       chain.TxCertRenew,
-		NodePubkey: id.PublicKey,
-		Timestamp:  chain.Now(),
-		Nonce:      nonce,
-		Payload:    payload,
-	}
-	chain.Sign(&tx, id)
-
-	tip := ch.Tip()
-	blk := chain.Block{
-		Index:     tip.Index + 1,
-		Timestamp: chain.Now(),
-		PrevHash:  tip.Hash,
-		Txs:       []chain.Transaction{tx},
-	}
-	blk.Hash = chain.ComputeHash(&blk)
-	return blk, nil
 }
 
-func buildRevokeBlock(ch *chain.Chain, id *crypto.Identity, nonce uint32, certID [32]byte) (chain.Block, error) {
-	payload, err := chain.MarshalRevoke(&chain.CertRevokePayload{
-		CertID:    certID,
-		Reason:    0, // unspecified
-		RevokedAt: chain.Now(),
-	})
+// loadKeyVaultMap reads the key-vault-map JSON file. Returns an empty map on error.
+func loadKeyVaultMap(path string) map[string]keyVaultEntry {
+	m := make(map[string]keyVaultEntry)
+	if path == "" {
+		return m
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return chain.Block{}, err
+		log.Printf("certd: read key-vault-map: %v", err)
+		return m
 	}
-
-	tx := chain.Transaction{
-		Type:       chain.TxCertRevoke,
-		NodePubkey: id.PublicKey,
-		Timestamp:  chain.Now(),
-		Nonce:      nonce,
-		Payload:    payload,
+	if err := json.Unmarshal(data, &m); err != nil {
+		log.Printf("certd: parse key-vault-map: %v", err)
 	}
-	chain.Sign(&tx, id)
-
-	tip := ch.Tip()
-	blk := chain.Block{
-		Index:     tip.Index + 1,
-		Timestamp: chain.Now(),
-		PrevHash:  tip.Hash,
-		Txs:       []chain.Transaction{tx},
-	}
-	blk.Hash = chain.ComputeHash(&blk)
-	return blk, nil
+	return m
 }
 
 func certIDFromAVX(certStore *cert.Store, avxCertID string) *[32]byte {
