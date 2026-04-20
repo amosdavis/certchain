@@ -187,3 +187,29 @@ func NewIssuerMetrics(r *Registry) *IssuerMetrics {
 	)
 	return m
 }
+
+// AnnotationRenewalMetrics collects annotation-ctrl renewal scheduler metrics.
+type AnnotationRenewalMetrics struct {
+	RenewalsTotal *prometheus.CounterVec
+	CertExpiry    *prometheus.GaugeVec
+}
+
+// NewAnnotationRenewalMetrics registers renewal scheduler metrics.
+func NewAnnotationRenewalMetrics(r *Registry) *AnnotationRenewalMetrics {
+	m := &AnnotationRenewalMetrics{
+		RenewalsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "certchain",
+			Subsystem: "annotation",
+			Name:      "renewals_total",
+			Help:      "Total annotation-ctrl cert renewals by result (success or error).",
+		}, []string{"result"}),
+		CertExpiry: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "certchain",
+			Subsystem: "annotation",
+			Name:      "cert_expiry_seconds",
+			Help:      "Seconds until certificate expiry for each managed secret.",
+		}, []string{"namespace", "name"}),
+	}
+	r.MustRegister(m.RenewalsTotal, m.CertExpiry)
+	return m
+}

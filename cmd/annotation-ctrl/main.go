@@ -51,6 +51,7 @@ func main() {
 	reconnectDelay := flag.Duration("reconnect-delay", 5*time.Second, "Delay before reconnecting a watch after an error")
 	readinessMaxStaleness := flag.Duration("readiness-max-staleness", 60*time.Second, "Maximum age of the last certd probe before /readyz returns 503 (CM-27)")
 	certdProbeInterval := flag.Duration("certd-probe-interval", 15*time.Second, "Background certd reachability probe interval for /readyz (CM-27)")
+	renewBefore := flag.Duration("renew-before", 30*24*time.Hour, "Renew certs this duration before NotAfter (default 30d)")
 	flag.Parse()
 
 	logger := logging.New(logging.Options{
@@ -80,9 +81,11 @@ func main() {
 
 	registry := metrics.NewRegistry()
 	annMetrics := annotation.NewMetrics(registry)
+	renewalMetrics := metrics.NewAnnotationRenewalMetrics(registry)
 
 	fetcher := annotation.NewHTTPFetcher(*certdURL, string(token))
-	reconciler := annotation.NewReconciler(k8sClient, fetcher, logger, annMetrics, annotation.NopRenewalNotifier{})
+	scheduler := annotation.NewRenewalScheduler(k8sClient, fetcher, *renewBefore, logger, renewalMetrics)
+	reconciler := annotation.NewReconciler(k8sClient, fetcher, logger, annMetrics, scheduler)
 	controller := annotation.NewController(k8sClient, reconciler, *namespace, logger).
 		WithReconnectDelay(*reconnectDelay)
 
@@ -103,6 +106,8 @@ func main() {
 
 	run := func(ctx context.Context) error {
 		ready.SetCachesSynced(true)
+		// Start renewal scheduler in background
+		go scheduler.Run(ctx, 1)
 		return controller.Run(ctx)
 	}
 

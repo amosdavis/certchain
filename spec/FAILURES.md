@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-34)
+# certchain Failure Mode Tenets (CM-01 to CM-35)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -932,3 +932,43 @@ continue to pass with `go test -race -count=1 ./internal/chain/...` to
 verify race-freedom. A future benchmark `BenchmarkSubmitParallel` may
 be added to quantify the throughput improvement, but is not required for
 correctness.
+
+---
+
+### CM-35 — Missing Renewal Scheduler Leaves Annotated Certs to Silently Expire
+
+**Risk:** annotation-ctrl (CM-33) provisions TLS Secrets on-demand when
+certchain.io/cert-cn annotation is present, but without an automatic
+renewal scheduler those Secrets remain at the NotAfter returned by certd
+at initial issuance. When the underlying cert expires on-chain and certd
+re-fetches fresh material from AVX, the annotation controller does not
+re-reconcile the Secret, leaving Pods and Services with expired TLS
+material. Apps fail TLS handshakes; operators get no Event warning that
+renewal is required.
+
+**Mitigation:**
+- RenewalScheduler watches Secrets carrying
+  certchain.io/managed-by=annotation-ctrl, parses the leaf cert's
+  NotAfter, and schedules a workqueue requeue at NotAfter - renewBefore
+  (default 30 days, configurable via --renew-before).
+- On requeue, the scheduler calls the same CertFetcher used by the
+  reconciler to fetch the latest cert from certd and updates the Secret
+  in-place (preserving metadata and ownerReferences).
+- Emits an Event of reason CertchainSecretRenewed on the owning
+  Pod/Service so kubectl describe shows the renewal timestamp.
+- If a cert has already expired at schedule time (delay <= 0), the
+  Secret is requeued immediately with exponential backoff so the
+  scheduler does not tight-loop on a permanently failed fetch.
+- Uses workqueue.AddAfter so each Secret has at most one pending
+  deadline; no unbounded goroutine-per-secret.
+- Metrics: certchain_annotation_renewals_total{result=success|error}
+  counter, certchain_annotation_cert_expiry_seconds gauge per
+  namespace/name to surface approaching expirations in dashboards.
+- The reconciler calls scheduler.OnNearExpiry(cn) after every
+  successful Secret upsert so schedule times stay synchronized with
+  on-chain material without polling.
+
+**Test:** TestScheduleRenewalTime table-driven unit tests verify delay
+computation; integration test with fake clock not provided but manual
+testing confirmed the full flow works in-cluster.
+
