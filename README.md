@@ -32,6 +32,29 @@ trust boundaries. Sample manifests live in
 
 ---
 
+## Annotation-Driven Certificates
+
+As an alternative to the cert-manager external issuer, **annotation-ctrl** provides
+a lightweight, annotation-driven path for TLS Secret delivery. Annotate any Pod or
+Service with `certchain.io/cert-cn: "your.hostname.com"`, and annotation-ctrl
+provisions a `kubernetes.io/tls` Secret in the same namespace with automatic renewal.
+
+**No cert-manager required.**  No CRDs.  Just annotations on your existing resources.
+
+See **[docs/annotation-ctrl/README.md](docs/annotation-ctrl/README.md)** for:
+- Quick start and deployment instructions
+- [Supported annotations](docs/annotation-ctrl/annotations.md) (`cert-cn`, `cert-secret-name`)
+- [Automatic renewal](docs/annotation-ctrl/renewal.md) (scheduled at `NotAfter - 30d`)
+- [Troubleshooting](docs/annotation-ctrl/troubleshooting.md) (Bearer token, RBAC, NetworkPolicy, CN sanitization)
+- [Examples](docs/annotation-ctrl/examples/) (Pod, Service, Ingress)
+
+Choose annotation-ctrl when you want simple opt-in via annotations; choose the
+cert-manager issuer when you need full cert-manager features (multiple Issuers,
+ACME, advanced renewal policies).  Both paths source certs from the same certchain
+blockchain and can coexist in a cluster (on different Secrets).
+
+---
+
 ## Why a Separate Blockchain?
 
 | Concern | Reason |
