@@ -1,0 +1,21 @@
+# PodDisruptionBudget (CM-31): annotation-ctrl runs a single replica with
+# leader election. Setting minAvailable: 0 allows voluntary disruptions
+# (node drains, cluster upgrades) to evict the sole replica without blocking,
+# while documenting the explicit intent that a brief window of unavailability
+# during drains is acceptable for this workload. Leader election ensures the
+# new replica picks up reconciliation after startup.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: annotation-ctrl
+  namespace: certchain
+spec:
+  # minAvailable: 0 allows drains to proceed even when only 1 replica exists.
+  # Rationale: annotation-ctrl is not HA-critical (TLS Secret provisioning can
+  # tolerate brief delays), and leader election ensures the new replica resumes
+  # work after drain completes. Multi-replica HA is not needed.
+  minAvailable: 0
+  selector:
+    matchLabels:
+      app: annotation-ctrl

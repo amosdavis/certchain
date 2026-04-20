@@ -1,0 +1,96 @@
+# NetworkPolicies (CM-31): lock down annotation-ctrl egress to only the
+# certd query service and kube-apiserver. Deny all else.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: annotation-ctrl-deny-all
+  namespace: certchain
+spec:
+  podSelector:
+    matchLabels:
+      app: annotation-ctrl
+  policyTypes:
+  - Ingress
+  - Egress
+---
+# annotation-ctrl ingress allow-list.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: annotation-ctrl-ingress
+  namespace: certchain
+spec:
+  podSelector:
+    matchLabels:
+      app: annotation-ctrl
+  policyTypes:
+  - Ingress
+  ingress:
+  # Metrics (9880) — only Prometheus scrapers. A namespace must advertise
+  # `prometheus: enabled` to be trusted as a scrape source.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          prometheus: enabled
+    ports:
+    - port: 9880
+      protocol: TCP
+  # Health probes (8082) — kubelet from kube-system only.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 8082
+      protocol: TCP
+---
+# annotation-ctrl egress allow-list. Restricted to certd query service
+# and kube-apiserver only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: annotation-ctrl-egress
+  namespace: certchain
+spec:
+  podSelector:
+    matchLabels:
+      app: annotation-ctrl
+  policyTypes:
+  - Egress
+  egress:
+  # DNS — cluster DNS for service resolution.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # kube-apiserver — annotation-ctrl calls into the apiserver over HTTPS
+  # to watch Pods/Services and manage Secrets. Allowing both the kube-system
+  # namespace (for the in-cluster "kubernetes" Service endpoints slice) and
+  # TCP/443/6443 to any destination captures both patterns.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 443
+      protocol: TCP
+    - port: 6443
+      protocol: TCP
+  # certd query API (9879) — annotation-ctrl → certd query service for
+  # certificate provisioning via Bearer-protected query API (CM-28).
+  - to:
+    - podSelector:
+        matchLabels:
+          app: certchain
+    ports:
+    - port: 9879
+      protocol: TCP

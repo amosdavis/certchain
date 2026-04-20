@@ -1,0 +1,18 @@
+# Kustomization for annotation-ctrl.
+#
+# Apply with:   kubectl apply -k deploy/annotation-ctrl/
+# Dry-run with: kubectl apply --dry-run=client -k deploy/annotation-ctrl/
+#
+# Requires a Secret named annotation-ctrl-token in the certchain namespace
+# with key 'token' containing the Bearer token for certd's query API (CM-28).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: certchain
+
+resources:
+- serviceaccount.yaml
+- rbac.yaml
+- deployment.yaml
+- networkpolicy.yaml
+- pdb.yaml

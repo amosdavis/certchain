@@ -1,0 +1,35 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: annotation-ctrl
+rules:
+# Pod and Service watching across namespaces for certchain.io/cert-cn annotation
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch"]
+# Secret management for kubernetes.io/tls Secrets provisioned by annotation-ctrl
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+# Event recording for diagnostic logging
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# Lease for leader election (CM-22)
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: annotation-ctrl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: annotation-ctrl
+subjects:
+- kind: ServiceAccount
+  name: annotation-ctrl
+  namespace: certchain
