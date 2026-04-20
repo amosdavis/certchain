@@ -87,3 +87,49 @@ jobs:
 
       - name: run BDD
         run: make bdd
+
+  dependency-audit:
+    name: dependency audit (CM-28)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: cache module download
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-gomod-audit-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomod-audit-
+            ${{ runner.os }}-gomod-
+
+      - name: go mod download
+        run: go mod download
+
+      - name: verify go.sum is in sync with go.mod
+        run: go mod verify
+
+      - name: go mod tidy -diff (fail on drift)
+        run: go mod tidy -diff
+
+      - name: install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2024.1.1
+
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: make audit
+        run: make audit GO=go STATICCHECK=staticcheck
+
+      - name: govulncheck (HIGH/CRITICAL gate)
+        # Default govulncheck behavior: non-zero exit on any reachable vuln.
+        # This step is redundant with `make audit` but is kept separate so
+        # the CI UI shows a clearly-named step when vulns are found.
+        run: govulncheck ./...

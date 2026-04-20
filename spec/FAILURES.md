@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-26)
+# certchain Failure Mode Tenets (CM-01 to CM-28)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -515,3 +515,45 @@ cover the controller-side invariants (`resolveIssuer` rejects bad
 `signerName` values). The CRD itself is validated by parsing
 `deploy/k8s/base/crds.yaml` as YAML during review and by
 `kubectl apply --dry-run=client` at deploy time.
+
+---
+
+## Category: Supply Chain
+
+### CM-28 — Unaudited Transitive Deps Introduce CVEs / License Violations
+
+**Risk:** Every module in `go.mod`'s transitive closure is code we ship and
+execute with the same privileges as certd and certchain-issuer. Without an
+automated audit, a vulnerable version of a Kubernetes client library, a
+Prometheus helper, or a deep yaml/json parser can land silently via a
+routine `go get` or tidy and go unnoticed until a CVE is filed publicly —
+at which point certchain nodes are already exposed. The same closure can
+also pull in a module under a license incompatible with the project's
+distribution terms (e.g., a surprise GPL transitive), creating a
+redistribution violation that only surfaces during legal review of a
+release tarball.
+
+**Mitigation:**
+- `docs/DEPENDENCIES.md` records a one-line rationale for every direct
+  dependency and states the update cadence policy; adding a new direct
+  dep requires updating that file in the same PR.
+- `make audit` (wired into `make verify`) runs `go vet`, `go mod tidy
+  -diff` (fails on drift between `go.mod`/`go.sum` and the import graph),
+  `staticcheck`, and `govulncheck ./...`. It is the single command a
+  developer runs to answer "are our deps clean right now?".
+- `make vuln` re-runs `govulncheck` alone for fast iteration after a
+  dependency bump.
+- `make licenses` produces `bin/modules.txt` (raw `go list -m all`) and
+  `bin/licenses.csv` (SPDX classification via `go-licenses`) so copyleft
+  or unknown-license modules are visible at review time.
+- The `dependency-audit` CI job runs after `build`, caches `~/go/pkg/mod`,
+  executes `go mod verify`, `go mod tidy -diff`, `make audit`, and a
+  standalone `govulncheck ./...` step. `govulncheck`'s default exit-on-vuln
+  behavior is what fails the build; no suppression file is permitted.
+- When a vuln is legitimately not reachable, it is documented under
+  "Known issues" in `docs/DEPENDENCIES.md` with the `govulncheck -show
+  verbose` output linked — never silently ignored.
+
+**Test:** `make audit` on a clean checkout; the `dependency-audit` CI job
+in `.github/workflows/ci.yml` asserts the same gate on every PR and push
+to master.

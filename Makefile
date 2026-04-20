@@ -9,7 +9,7 @@ GO            ?= go
 GOLANGCI_LINT ?= golangci-lint
 STATICCHECK   ?= staticcheck
 
-.PHONY: all build test bdd lint vet fmt staticcheck tidy verify clean
+.PHONY: all build test bdd lint vet fmt staticcheck tidy verify audit vuln licenses clean
 
 all: build test
 
@@ -53,7 +53,36 @@ tidy:
 	$(GO) mod tidy
 
 # verify runs the full gate used in CI. Fails fast on the first problem.
-verify: fmt vet lint staticcheck test
+verify: fmt vet lint staticcheck audit test
+
+# audit is the dependency-hygiene gate for CM-28. It is intentionally
+# composed of existing checks (vet, tidy-diff, staticcheck) plus govulncheck
+# so that a single target answers "are our deps clean right now?"
+#
+# `go mod tidy -diff` prints the exact go.mod/go.sum changes tidy would make
+# and exits non-zero if any are needed, which catches drift between committed
+# manifests and the import graph.
+audit:
+	$(GO) vet ./...
+	$(GO) mod tidy -diff
+	$(STATICCHECK) ./...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# vuln is a narrower alias for "just the CVE scan" so developers can rerun
+# the slow part of audit in isolation after bumping a dependency.
+vuln:
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# licenses produces a CSV inventory of every module in the build graph.
+# `go-licenses report` classifies each module's LICENSE file against the
+# SPDX identifier set so copyleft/unknown licenses are visible at review
+# time. We also keep a raw `go list -m all` snapshot as a fallback for
+# modules go-licenses cannot classify (vendored, replaced, etc.).
+licenses:
+	@mkdir -p bin
+	$(GO) list -m all > bin/modules.txt
+	$(GO) run github.com/google/go-licenses@latest report ./... > bin/licenses.csv
+	@echo "wrote bin/modules.txt and bin/licenses.csv"
 
 clean:
 	rm -rf bin/
