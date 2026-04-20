@@ -3,6 +3,12 @@
 # Cert-manager CertificateRequest objects that reference this via
 # issuerRef.kind=CertchainClusterIssuer and issuerRef.group=certchain.io
 # will be fulfilled by the certchain-issuer controller.
+#
+# See spec/FAILURES.md tenet CM-26: CRDs without strict OpenAPI v3 validation
+# silently accept malformed specs which surface as runtime reconcile errors.
+# All object schemas below set additionalProperties: false and pin types,
+# patterns, and enums so the API server rejects malformed resources at
+# admission time.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -20,40 +26,6 @@ spec:
   - name: v1alpha1
     served: true
     storage: true
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            properties:
-              signerName:
-                type: string
-                description: >
-                  The K8s CertificateSigningRequest signerName certchain-issuer
-                  will use. Must match the --k8s-signer-name flag on certd.
-                  Defaults to "certchain.io/appviewx" if omitted.
-                default: "certchain.io/appviewx"
-          status:
-            type: object
-            properties:
-              conditions:
-                type: array
-                items:
-                  type: object
-                  required: [type, status]
-                  properties:
-                    type:
-                      type: string
-                    status:
-                      type: string
-                    reason:
-                      type: string
-                    message:
-                      type: string
-                    lastTransitionTime:
-                      type: string
-                      format: date-time
     subresources:
       status: {}
     additionalPrinterColumns:
@@ -63,9 +35,70 @@ spec:
     - name: Age
       type: date
       jsonPath: .metadata.creationTimestamp
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: >
+          CertchainClusterIssuer configures a cluster-scoped cert-manager
+          external issuer fulfilled by certchain-issuer.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            type: object
+            additionalProperties: false
+            properties:
+              signerName:
+                type: string
+                description: >
+                  The K8s CertificateSigningRequest signerName certchain-issuer
+                  will use. Must match the --k8s-signer-name flag on certd and
+                  must be in the certchain.io/ namespace.
+                minLength: 14
+                maxLength: 253
+                pattern: '^certchain\.io/[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$'
+                default: "certchain.io/appviewx"
+          status:
+            type: object
+            additionalProperties: false
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [type, status]
+                  properties:
+                    type:
+                      type: string
+                      minLength: 1
+                      maxLength: 316
+                      pattern: '^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$'
+                    status:
+                      type: string
+                      enum: ["True", "False", "Unknown"]
+                    reason:
+                      type: string
+                      maxLength: 1024
+                    message:
+                      type: string
+                      maxLength: 32768
+                    observedGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                    lastTransitionTime:
+                      type: string
+                      format: date-time
 ---
 # CertchainIssuer — namespace-scoped issuer resource.
 # Use when you want to restrict issuance to a specific namespace.
+#
+# See spec/FAILURES.md tenet CM-26.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -83,39 +116,6 @@ spec:
   - name: v1alpha1
     served: true
     storage: true
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            properties:
-              signerName:
-                type: string
-                description: >
-                  The K8s CertificateSigningRequest signerName certchain-issuer
-                  will use. Defaults to "certchain.io/appviewx" if omitted.
-                default: "certchain.io/appviewx"
-          status:
-            type: object
-            properties:
-              conditions:
-                type: array
-                items:
-                  type: object
-                  required: [type, status]
-                  properties:
-                    type:
-                      type: string
-                    status:
-                      type: string
-                    reason:
-                      type: string
-                    message:
-                      type: string
-                    lastTransitionTime:
-                      type: string
-                      format: date-time
     subresources:
       status: {}
     additionalPrinterColumns:
@@ -125,3 +125,61 @@ spec:
     - name: Age
       type: date
       jsonPath: .metadata.creationTimestamp
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: >
+          CertchainIssuer configures a namespace-scoped cert-manager external
+          issuer fulfilled by certchain-issuer.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            type: object
+            additionalProperties: false
+            properties:
+              signerName:
+                type: string
+                description: >
+                  The K8s CertificateSigningRequest signerName certchain-issuer
+                  will use. Must be in the certchain.io/ namespace.
+                minLength: 14
+                maxLength: 253
+                pattern: '^certchain\.io/[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$'
+                default: "certchain.io/appviewx"
+          status:
+            type: object
+            additionalProperties: false
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [type, status]
+                  properties:
+                    type:
+                      type: string
+                      minLength: 1
+                      maxLength: 316
+                      pattern: '^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$'
+                    status:
+                      type: string
+                      enum: ["True", "False", "Unknown"]
+                    reason:
+                      type: string
+                      maxLength: 1024
+                    message:
+                      type: string
+                      maxLength: 32768
+                    observedGeneration:
+                      type: integer
+                      format: int64
+                      minimum: 0
+                    lastTransitionTime:
+                      type: string
+                      format: date-time

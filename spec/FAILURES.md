@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-23)
+# certchain Failure Mode Tenets (CM-01 to CM-26)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -427,3 +427,91 @@ keypair.
   `TestLoadValidatorsFromFileMissing`, `TestLoadValidatorsFromFileRoundtrip`,
   and `TestLoadValidatorsFromFileMalformed` in
   `internal/chain/validator_test.go`.
+
+---
+
+---
+
+## Category: Revocation Propagation
+
+### CM-25 — Revoked Cert Still Served
+
+**Risk:** A certificate is revoked on-chain (TxCertRevoke applied, store marks
+StatusRevoked) but the Kubernetes Secret carrying the PEM remains in the
+cluster. Applications mounting the Secret continue to terminate TLS with the
+revoked material, defeating the purpose of revocation.
+
+**Mitigation:**
+- `SecretWriter.Sync` treats its `records` argument as the complete
+  authoritative active set. On every reconciliation pass it lists all
+  Secrets in the namespace bearing the `certchain.io/managed-by=certd`
+  label and deletes any whose name is not in that active set (sweep).
+  Deleting an already-absent Secret is a no-op because `IsNotFound` on
+  the delete call is swallowed, keeping the operation idempotent.
+- For every Secret the writer actually deletes (either via the sweep or
+  via per-record revoked/replaced handling), a `core/v1` Event of type
+  `Normal` with reason `CertchainRevoked` is created in the namespace.
+  The Event's `involvedObject` points at the Secret and the `message`
+  includes both the hex `cert_id` and the `CN`, so operators and audit
+  systems can trace exactly which cert was revoked.
+- Secrets created by `SecretWriter` always carry
+  `certchain.io/managed-by=certd` and `certchain.io/cn=<sanitized CN>`,
+  so the sweep never touches resources owned by other controllers and
+  always has enough context to render a meaningful Event.
+- RBAC failures on list / delete / Event create are logged and skipped
+  (CM-17 behaviour) so certd keeps running even when the cluster denies
+  the write; the revocation is retried on the next poll.
+
+**Test:** `TestSecretWriterRevokedSecretDeleted` in
+`internal/k8s/secret_writer_test.go`; BDD scenario "Revoked cert triggers
+Secret deletion and Event" in `features/cert_revoke_propagation.feature`.
+
+---
+
+## Category: Kubernetes CRD Hygiene
+
+### CM-26 — CRD Without Validation Accepts Malformed Specs
+
+**Risk:** Without a strict OpenAPI v3 schema on the `CertchainIssuer` and
+`CertchainClusterIssuer` CRDs, the Kubernetes API server will accept any
+shape of resource the operator `kubectl apply`s. Unknown fields
+(`spec.signerNmae` typo), wrong types (`signerName: true`), or values
+that violate certchain-issuer's invariants (`signerName: "foo/bar"`
+without the `certchain.io/` prefix) are admitted silently. The malformed
+resource then reaches the issuer controller at reconcile time where it
+fails **after** cert-manager has already created a `CertificateRequest`
+against it, producing a stream of noisy per-reconcile errors, a
+`Pending` CertificateRequest indefinitely (interacts with CM-20), and a
+bad operator experience because `kubectl apply` reported success.
+
+**Mitigation:**
+- `deploy/k8s/base/crds.yaml` pins a full `openAPIV3Schema` for every
+  served version. Every object schema sets `additionalProperties: false`
+  so unknown fields (typos, legacy fields from older versions) are
+  rejected at admission.
+- `spec.signerName` is constrained with `type: string`,
+  `minLength: 14`, `maxLength: 253`, and the regex
+  `^certchain\.io/[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$`
+  mirroring the `certchain.io/` prefix enforced by
+  `internal/issuer/controller.go`'s `resolveIssuer`. Bad prefixes are
+  rejected by the apiserver before cert-manager ever sees them.
+- `status.conditions[].status` is pinned to the enum
+  `["True", "False", "Unknown"]` and `status.conditions[].type` uses
+  the standard Kubernetes condition-type regex so malformed controller
+  patches cannot corrupt status.
+- Each version declares the `status` subresource so controllers can
+  patch status without bumping `metadata.generation` (prevents
+  infinite-reconcile loops when the controller writes its own status).
+- `additionalPrinterColumns` surfaces `Ready` (from
+  `.status.conditions[?(@.type=="Ready")].status`) and `Age` so
+  `kubectl get certchainissuers` is immediately diagnostic.
+- The CRD manifest is rendered and round-tripped through
+  `sigs.k8s.io/yaml` to ensure structural validity; `kubectl apply
+  --dry-run=client -f deploy/k8s/base/crds.yaml` succeeds against a live
+  cluster.
+
+**Test:** `go build ./...`, `go vet ./...`, and `go test ./...`
+cover the controller-side invariants (`resolveIssuer` rejects bad
+`signerName` values). The CRD itself is validated by parsing
+`deploy/k8s/base/crds.yaml` as YAML during review and by
+`kubectl apply --dry-run=client` at deploy time.

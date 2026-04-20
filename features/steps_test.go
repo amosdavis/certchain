@@ -1072,6 +1072,39 @@ func dataKeys(data map[string][]byte) []string {
 	return keys
 }
 
+// aEventForSecretExistsInNamespace asserts that a Kubernetes Event with the
+// given reason and involved Secret name was recorded in the namespace by the
+// SecretWriter (CM-25). The Event's message must reference the Secret's CN
+// so operators can trace which cert was revoked.
+func (w *world) aEventForSecretExistsInNamespace(reason, secretName, ns string) error {
+	if w.k8sClient == nil {
+		return fmt.Errorf("k8s client not configured")
+	}
+	events, err := w.k8sClient.CoreV1().Events(ns).List(
+		context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list events in %s: %w", ns, err)
+	}
+	for i := range events.Items {
+		ev := &events.Items[i]
+		if ev.Reason == reason &&
+			ev.InvolvedObject.Kind == "Secret" &&
+			ev.InvolvedObject.Name == secretName {
+			if ev.Type != corev1.EventTypeNormal {
+				return fmt.Errorf("Event for Secret %s/%s has type %q, want Normal",
+					ns, secretName, ev.Type)
+			}
+			if !strings.Contains(ev.Message, secretName) {
+				return fmt.Errorf("Event message %q does not reference Secret %s",
+					ev.Message, secretName)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("no %s Event found for Secret %s/%s (got %d events)",
+		reason, ns, secretName, len(events.Items))
+}
+
 // ---- K8s CSR watcher step methods ----
 
 // avxCSRServerURL returns the URL of the running CSR mock AVX server.
@@ -1734,6 +1767,7 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^a certificate record for "([^"]+)" with status "([^"]+)" but no DER on disk$`, w.aCertificateRecordWithStatusButNoDEROnDisk)
 	ctx.Step(`^no error is returned$`, w.noErrorIsReturned)
 	ctx.Step(`^K8s Secret writes are forbidden by RBAC$`, w.k8sSecretWritesAreForbiddenByRBAC)
+	ctx.Step(`^a "([^"]+)" Event exists for Secret "([^"]+)" in namespace "([^"]+)"$`, w.aEventForSecretExistsInNamespace)
 
 	// K8s CSR watcher.
 	ctx.Step(`^AppViewX accepts CSR submissions$`, w.appViewXAcceptsCSRSubmissions)

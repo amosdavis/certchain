@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,6 +243,96 @@ func TestSecretWriterMissingDERSkips(t *testing.T) {
 	_, err := fakeClient.CoreV1().Secrets("certchain").Get(ctx, name, metav1.GetOptions{})
 	if !k8serrors.IsNotFound(err) {
 		t.Errorf("expected Secret to be absent when DER missing, got err=%v", err)
+	}
+}
+
+// TestSecretWriterRevokedSecretDeleted verifies CM-25: when a cert drops out
+// of the active set (because it was revoked on-chain and is no longer passed
+// to Sync), its Secret is deleted and a CertchainRevoked Event is emitted.
+func TestSecretWriterRevokedSecretDeleted(t *testing.T) {
+	fakeClient := k8sfake.NewSimpleClientset()
+	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
+	ctx := context.Background()
+
+	recA := makeRecord("a.example.com", cert.StatusActive)
+	recB := makeRecord("b.example.com", cert.StatusActive)
+	configDir := t.TempDir()
+	writeFakeDER(t, configDir, recA.CertID)
+	writeFakeDER(t, configDir, recB.CertID)
+
+	// First Sync: both certs active -> both Secrets written.
+	if err := sw.Sync(ctx, []*cert.Record{recA, recB}, configDir); err != nil {
+		t.Fatalf("Sync (initial): %v", err)
+	}
+	nameA := certk8s.SecretName("cc", "a.example.com")
+	nameB := certk8s.SecretName("cc", "b.example.com")
+	for _, n := range []string{nameA, nameB} {
+		if _, err := fakeClient.CoreV1().Secrets("certchain").Get(ctx, n, metav1.GetOptions{}); err != nil {
+			t.Fatalf("expected Secret %s to exist after initial Sync: %v", n, err)
+		}
+	}
+
+	// Second Sync: only cert-B in the active set. cert-A was revoked and
+	// the chain no longer emits it as an active record.
+	if err := sw.Sync(ctx, []*cert.Record{recB}, configDir); err != nil {
+		t.Fatalf("Sync (after revocation): %v", err)
+	}
+
+	// Secret A must be gone, Secret B must still exist.
+	if _, err := fakeClient.CoreV1().Secrets("certchain").Get(ctx, nameA, metav1.GetOptions{}); !k8serrors.IsNotFound(err) {
+		t.Errorf("expected Secret %s to be deleted, got err=%v", nameA, err)
+	}
+	if _, err := fakeClient.CoreV1().Secrets("certchain").Get(ctx, nameB, metav1.GetOptions{}); err != nil {
+		t.Errorf("expected Secret %s to still exist, got err=%v", nameB, err)
+	}
+
+	// A CertchainRevoked Event must have been emitted referencing Secret A.
+	events, err := fakeClient.CoreV1().Events("certchain").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var found *corev1.Event
+	for i := range events.Items {
+		ev := &events.Items[i]
+		if ev.Reason == certk8s.EventReasonRevoked && ev.InvolvedObject.Name == nameA {
+			found = ev
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected a %s Event for Secret %s; got %d events", certk8s.EventReasonRevoked, nameA, len(events.Items))
+	}
+	if found.Type != corev1.EventTypeNormal {
+		t.Errorf("Event type = %q, want Normal", found.Type)
+	}
+	if found.InvolvedObject.Kind != "Secret" {
+		t.Errorf("Event involvedObject.Kind = %q, want Secret", found.InvolvedObject.Kind)
+	}
+	certIDHex := fmt.Sprintf("%x", recA.CertID)
+	if !strings.Contains(found.Message, certIDHex) {
+		t.Errorf("Event message %q missing cert_id %s", found.Message, certIDHex)
+	}
+	if !strings.Contains(found.Message, recA.CN) {
+		t.Errorf("Event message %q missing CN %s", found.Message, recA.CN)
+	}
+
+	// Idempotency: re-syncing the same active set must not error and must
+	// not delete Secret B or emit a second Event for the already-gone A.
+	if err := sw.Sync(ctx, []*cert.Record{recB}, configDir); err != nil {
+		t.Fatalf("Sync (idempotent): %v", err)
+	}
+	events2, _ := fakeClient.CoreV1().Events("certchain").List(ctx, metav1.ListOptions{})
+	countFor := func(list *corev1.EventList, name string) int {
+		n := 0
+		for i := range list.Items {
+			if list.Items[i].InvolvedObject.Name == name && list.Items[i].Reason == certk8s.EventReasonRevoked {
+				n++
+			}
+		}
+		return n
+	}
+	if got := countFor(events2, nameA); got != 1 {
+		t.Errorf("expected exactly 1 CertchainRevoked Event for %s after idempotent re-sync, got %d", nameA, got)
 	}
 }
 
