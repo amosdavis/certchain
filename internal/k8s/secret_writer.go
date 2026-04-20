@@ -64,6 +64,13 @@ type SecretWriter struct {
 }
 
 // NewSecretWriter creates a SecretWriter.
+//
+// Deprecated: the certd direct-write Secret path is superseded by the
+// cert-manager external issuer under cmd/certchain-issuer.  Running both
+// paths concurrently risks split-brain Secret ownership (CM-30).  This
+// constructor is retained only for migration and development use behind
+// certd's --enable-legacy-secret-writer flag, and is scheduled for removal
+// in certchain v2.  See docs/MIGRATION-LEGACY-SECRETS.md.
 func NewSecretWriter(client kubernetes.Interface, namespace, prefix string) *SecretWriter {
 	return &SecretWriter{
 		client:    client,

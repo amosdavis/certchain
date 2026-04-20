@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-29)
+# certchain Failure Mode Tenets (CM-01 to CM-30)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -614,3 +614,54 @@ different chainID, rejection of a tampered domain prefix, acceptance +
 counter increment for a legacy-format signature when the compat flag is
 on, and confirms the legacy path is not hit for a correctly-signed new
 transaction.
+
+
+---
+
+## Category: Cert Delivery Path Isolation
+
+### CM-30 — Two Cert-Delivery Paths Active Simultaneously Cause Split-Brain Secret Ownership
+
+**Risk:** certchain supports two mechanisms for placing a TLS Secret into a
+Pod's namespace: the original certd direct-write Secret writer
+(`internal/k8s/secret_writer.go`, CM-16/17/25) and the modern cert-manager
+external issuer (`cmd/certchain-issuer`). If both run against the same
+namespaces at the same time, they can race on the same Secret name: certd
+upserts PEM under its `certchain.io/managed-by=certd` label, cert-manager
+then overwrites it with its own annotations, and on the next certd sweep
+(CM-25) the cert-manager-owned Secret either gets deleted because its
+cert-id label no longer matches or is left orphaned because the
+`managed-by` label is missing. The result is an unstable Secret whose
+provenance cannot be reconstructed from labels alone, Events fire from
+both controllers for the same rotation, and operators cannot tell which
+system they should trust in an incident.
+
+**Mitigation:**
+- The direct-write path is deprecated. `NewSecretWriter` carries a
+  `// Deprecated:` doc comment so `staticcheck` SA1019 flags any new
+  caller, and `internal/k8s/legacy_doc.go` states the policy at the
+  package level.
+- certd gates the writer behind `--enable-legacy-secret-writer` (env
+  `ENABLE_LEGACY_SECRET_WRITER`), default **false**. With the flag off,
+  the writer is not constructed, no sync goroutine is started, and the
+  first would-be trigger logs a one-shot `WARN`
+  (`LegacyWriterDisabledWarning`) pointing at
+  `docs/MIGRATION-LEGACY-SECRETS.md`.
+- With the flag on, certd logs a prominent startup `WARN`
+  (`LegacyWriterStartupWarning`) naming the deprecation and the v2
+  removal so operators cannot run the legacy path by accident.
+- `docs/MIGRATION-LEGACY-SECRETS.md` documents the full migration
+  procedure: inventory the `managed-by=certd` Secrets, install the
+  external issuer, author cert-manager `Certificate` CRs that reuse the
+  existing Secret names for drop-in cutover, restart consumers, then flip
+  the flag off. A rollback path is included.
+- The CSR watcher and all other K8s integration points are independent of
+  the writer, so disabling the legacy path does not degrade the modern
+  issuer's CSR-to-chain bridge.
+
+**Test:** existing `internal/k8s/secret_writer_test.go` tests continue
+to pass by constructing the writer directly (bypassing the flag); certd's
+flag-off path is exercised by inspection of `cmd/certd/main.go`: the
+`sw` variable is only constructed inside the `*enableLegacySecretWriter`
+branch, and `go vet ./...` plus `go build ./...` enforce that no
+other caller of `NewSecretWriter` exists outside that branch.

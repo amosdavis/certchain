@@ -102,6 +102,8 @@ func makeRecord(cn string, status cert.Status) *cert.Record {
 // a K8s Secret being created with the expected labels and data.
 func TestSecretWriterUpsertCreatesSecret(t *testing.T) {
 	fakeClient := k8sfake.NewSimpleClientset()
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 
 	rec := makeRecord("api.example.com", cert.StatusActive)
@@ -136,6 +138,8 @@ func TestSecretWriterUpsertCreatesSecret(t *testing.T) {
 // Secret is deleted when the cert-id label matches.
 func TestSecretWriterRevokedDeletesOwnedSecret(t *testing.T) {
 	fakeClient := k8sfake.NewSimpleClientset()
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 
 	rec := makeRecord("old.example.com", cert.StatusActive)
@@ -166,6 +170,8 @@ func TestSecretWriterRevokedDeletesOwnedSecret(t *testing.T) {
 // (because a renewal already replaced it), the Secret is not deleted.
 func TestSecretWriterRenewalDoesNotDeleteNewSecret(t *testing.T) {
 	fakeClient := k8sfake.NewSimpleClientset()
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 	ctx := context.Background()
 
@@ -212,6 +218,8 @@ func TestSecretWriterRBACForbiddenSkips(t *testing.T) {
 	fakeClient.PrependReactor("create", "secrets", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, k8serrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "cc-api.example.com", fmt.Errorf("forbidden"))
 	})
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 
 	rec := makeRecord("api.example.com", cert.StatusActive)
@@ -229,6 +237,8 @@ func TestSecretWriterRBACForbiddenSkips(t *testing.T) {
 // cached locally is skipped gracefully (CM-12).
 func TestSecretWriterMissingDERSkips(t *testing.T) {
 	fakeClient := k8sfake.NewSimpleClientset()
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 
 	rec := makeRecord("nodecache.example.com", cert.StatusActive)
@@ -251,6 +261,8 @@ func TestSecretWriterMissingDERSkips(t *testing.T) {
 // to Sync), its Secret is deleted and a CertchainRevoked Event is emitted.
 func TestSecretWriterRevokedSecretDeleted(t *testing.T) {
 	fakeClient := k8sfake.NewSimpleClientset()
+	//lint:ignore SA1019 transitional callsite for legacy writer
+	//lint:ignore SA1019 transitional callsite for legacy writer
 	sw := certk8s.NewSecretWriter(fakeClient, "certchain", "cc")
 	ctx := context.Background()
 

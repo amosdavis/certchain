@@ -22,6 +22,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component diagram
 trust boundaries. Sample manifests live in
 [`deploy/k8s/examples/`](deploy/k8s/examples).
 
+> **Deprecated:** certd's direct-write Secret path
+> (`internal/k8s/secret_writer.go`) is superseded by the cert-manager
+> external issuer above and is gated behind `--enable-legacy-secret-writer`
+> (default `false`).  Running both paths concurrently risks split-brain
+> Secret ownership (CM-30).  The legacy path will be removed in certchain
+> v2 — see **[docs/MIGRATION-LEGACY-SECRETS.md](docs/MIGRATION-LEGACY-SECRETS.md)**
+> for the migration runbook.
+
 ---
 
 ## Why a Separate Blockchain?
