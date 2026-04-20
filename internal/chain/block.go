@@ -128,13 +128,6 @@ func signingPayload(tx *Transaction) []byte {
 
 // ---- Transaction helpers ----
 
-// SigningMessage returns the SHA-256 of the signing payload (what gets signed).
-func SigningMessage(tx *Transaction) []byte {
-	raw := signingPayload(tx)
-	h := sha256.Sum256(raw)
-	return h[:]
-}
-
 // Now returns the current unix timestamp in seconds.
 func Now() int64 {
 	return time.Now().UTC().Unix()

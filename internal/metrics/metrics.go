@@ -74,6 +74,20 @@ func NewChainMetrics(r *Registry) *ChainMetrics {
 	return m
 }
 
+// NewChainLegacySigCounter registers and returns the counter that tracks
+// the number of transactions that verify only under the legacy (pre-CM-29)
+// signing format. Wired into the chain package via chain.WithMetrics.
+func NewChainLegacySigCounter(r *Registry) prometheus.Counter {
+	c := prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "certchain",
+		Subsystem: "chain",
+		Name:      "legacy_sig_count",
+		Help:      "Total transactions that verified only under the legacy (pre-CM-29) no-domain-separator signing format.",
+	})
+	r.MustRegister(c)
+	return c
+}
+
 // AVXMetrics collects AppViewX client metrics.
 type AVXMetrics struct {
 	RequestsTotal  *prometheus.CounterVec

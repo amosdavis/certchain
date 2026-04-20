@@ -62,6 +62,8 @@ func main() {
 	k8sSignerName   := flag.String("k8s-signer-name", "", "CSR signerName to watch (default: certchain.io/appviewx)")
 	metricsAddr     := flag.String("metrics-addr", ":9880", "Address for Prometheus /metrics (H3)")
 	validatorsFile  := flag.String("validators", "", "path to validators.json allowlist (default: <config>/validators.json, CM-23)")
+	chainID          := flag.String("chain-id", chain.DefaultChainID, "chainID mixed into the signature domain separator (CM-29); must match across all peers in a network")
+	acceptLegacySigs := flag.Bool("accept-legacy-sigs", true, "accept signatures in the pre-CM-29 no-domain-separator format; flip to false once all peers have re-signed (CM-29)")
 	flag.Parse()
 
 	// Allow env-var overrides so k8s ConfigMaps/Secrets can drive configuration
@@ -94,7 +96,11 @@ func main() {
 	_ = metrics.NewAVXMetrics(registry)
 	startCertdMetricsServer(*metricsAddr, registry)
 
-	ch := chain.New()
+	ch := chain.New(
+		chain.WithChainID(*chainID),
+		chain.WithAcceptLegacySigs(*acceptLegacySigs),
+		chain.WithMetrics(registry),
+	)
 	certStore := cert.NewStore(*maxCerts)
 	peerTable := peer.NewTable()
 

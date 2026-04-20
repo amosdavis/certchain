@@ -7,6 +7,8 @@ package chain
 import (
 	"errors"
 	"sync"
+
+	"github.com/amosdavis/certchain/internal/metrics"
 )
 
 const (
@@ -21,6 +23,51 @@ type Chain struct {
 	seqMap     map[[32]byte]uint32  // last seen nonce per node pubkey
 	rateMap    map[[32]byte][]int64 // block indices of recent txs per node
 	validators *ValidatorSet       // nil = accept any signer (CM-23)
+
+	// chainID and acceptLegacySigs reflect the signing context installed
+	// by New (CM-29). They are recorded here so callers can introspect
+	// the chain's configuration; the authoritative values that Sign /
+	// Verify consult live in the signing package globals.
+	chainID          string
+	acceptLegacySigs bool
+}
+
+// Option configures a Chain at construction time.
+type Option func(*Chain)
+
+// WithChainID sets the chainID mixed into the signature domain separator
+// (CM-29). An empty string is treated as DefaultChainID. Values longer
+// than 255 bytes cause New to panic at startup.
+func WithChainID(chainID string) Option {
+	return func(c *Chain) {
+		if chainID == "" {
+			chainID = DefaultChainID
+		}
+		c.chainID = chainID
+	}
+}
+
+// WithAcceptLegacySigs controls whether Verify falls back to the pre-CM-29
+// (no domain prefix) signing format. Default true; flip to false after the
+// legacy-block migration is complete so replays of pre-upgrade signatures
+// are rejected network-wide.
+func WithAcceptLegacySigs(accept bool) Option {
+	return func(c *Chain) {
+		c.acceptLegacySigs = accept
+	}
+}
+
+// WithMetrics wires the chain's Prometheus counters, including the
+// legacy-signature counter used by CM-29's compat path. Pass nil to leave
+// metrics unwired (tests).
+func WithMetrics(reg *metrics.Registry) Option {
+	return func(c *Chain) {
+		if reg == nil {
+			return
+		}
+		counter := metrics.NewChainLegacySigCounter(reg)
+		SetLegacySigHook(func() { counter.Inc() })
+	}
 }
 
 // SetValidators installs an allowlist of authorized block authors. A nil
@@ -40,13 +87,40 @@ func (c *Chain) Validators() *ValidatorSet {
 }
 
 // New creates a Chain initialised with the genesis block.
-func New() *Chain {
+func New(opts ...Option) *Chain {
 	genesis := GenesisBlock()
-	return &Chain{
-		blocks:  []Block{genesis},
-		seqMap:  make(map[[32]byte]uint32),
-		rateMap: make(map[[32]byte][]int64),
+	c := &Chain{
+		blocks:           []Block{genesis},
+		seqMap:           make(map[[32]byte]uint32),
+		rateMap:          make(map[[32]byte][]int64),
+		chainID:          DefaultChainID,
+		acceptLegacySigs: true,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	// Install the process-wide signing context from the chain's settings.
+	// A bad chainID length is a startup programmer error, not a runtime
+	// recoverable condition, so panic loudly (CM-29).
+	if err := SetSigningContext(c.chainID, c.acceptLegacySigs); err != nil {
+		panic("chain.New: " + err.Error())
+	}
+	return c
+}
+
+// ChainID returns the chainID configured for this chain (CM-29).
+func (c *Chain) ChainID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.chainID
+}
+
+// AcceptsLegacySigs reports whether this chain still accepts signatures in
+// the pre-CM-29 no-domain-prefix format.
+func (c *Chain) AcceptsLegacySigs() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.acceptLegacySigs
 }
 
 // Len returns the number of blocks in the chain.

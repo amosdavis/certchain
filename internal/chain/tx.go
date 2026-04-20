@@ -1,28 +1,9 @@
-// tx.go — transaction signing and verification for certchain.
+// tx.go — transaction payload validation for certchain.
 package chain
 
 import (
 	"errors"
-
-	"github.com/amosdavis/certchain/internal/crypto"
 )
-
-// Sign signs a transaction using the provided identity. The signature covers
-// the SHA-256 of the signing payload (type + pubkey + timestamp + nonce + payload).
-func Sign(tx *Transaction, id *crypto.Identity) {
-	msg := SigningMessage(tx)
-	tx.Signature = id.Sign(msg)
-}
-
-// Verify verifies the Ed25519 signature on a transaction.
-// Returns nil if valid, an error otherwise.
-func Verify(tx *Transaction) error {
-	msg := SigningMessage(tx)
-	if !crypto.Verify(tx.NodePubkey, msg, tx.Signature) {
-		return errors.New("invalid transaction signature")
-	}
-	return nil
-}
 
 // ValidatePayload validates the type-specific fields of a transaction.
 func ValidatePayload(tx *Transaction) error {

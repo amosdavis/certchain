@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-28)
+# certchain Failure Mode Tenets (CM-01 to CM-29)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -557,3 +557,60 @@ release tarball.
 **Test:** `make audit` on a clean checkout; the `dependency-audit` CI job
 in `.github/workflows/ci.yml` asserts the same gate on every PR and push
 to master.
+
+---
+
+## Category: Cryptographic Agility
+
+### CM-29 — Signature Scheme Without Domain Separation Enables Cross-Protocol / Cross-Chain Reuse
+
+**Risk:** Prior to CM-29 the transaction signature was computed directly
+over the canonical transaction bytes (`sha256(type || pubkey || ts ||
+nonce || payload)`) with no context tag and no chain identifier. Two
+attack classes follow. First, if any other part of the system — a peer
+handshake, a future block-header signature, a message-authentication
+token, or a third-party tool — ever signs a byte string that happens to
+collide with a valid transaction prefix, the same Ed25519 signature is
+simultaneously valid in both contexts; an attacker who can influence what
+a legitimate signer signs in the "other" context gets a replay-usable
+transaction signature for free. Second, without a chain identifier
+mixed into the signed bytes, a signature produced on one certchain
+network (e.g., staging) is bit-for-bit valid on every other certchain
+network that uses the same key (e.g., production, a fork, a disaster-
+recovery restore, a test shard). A staging outage that leaks a signed tx
+therefore directly compromises production, and a chain fork cannot
+safely share keys with the parent.
+
+**Mitigation:**
+- `internal/chain/signing.go` defines a domain separator
+  `SigningDomain = "certchain/v1/tx\x00"` and prepends, before each
+  signature, the bytes `SigningDomain || uint8(len(chainID)) || chainID
+  || <canonical tx bytes>` which are then sha256'd and signed with
+  Ed25519. The length-prefixed chainID makes the encoding unambiguous
+  and caps chainID at 255 bytes.
+- `chain.New` accepts `WithChainID(id)` and `WithAcceptLegacySigs
+  (bool)` options; `certd` exposes these as `--chain-id` (default
+  `certchain-default`) and `--accept-legacy-sigs` (default `true`
+  for migration). Production deployments MUST set a per-network
+  `--chain-id` and SHOULD flip `--accept-legacy-sigs=false` once
+  every peer has re-signed.
+- Canonical tx bytes (`signingPayload` in `block.go`) are preserved
+  unchanged, so on-disk block hashes, the peer wire format, and the
+  query API are all backwards compatible; only the Ed25519 input
+  changes.
+- Because Ed25519 is EUF-CMA-secure, prepending a fixed, agreed-upon
+  domain tag cannot weaken the scheme; it only shrinks the set of
+  inputs an adversary can legitimately obtain a signature over.
+- When `--accept-legacy-sigs=true` a verify that fails the new-domain
+  check is retried against the legacy (pre-CM-29) digest; every
+  successful legacy verify increments the
+  `certchain_chain_legacy_sig_count` Prometheus counter and emits a
+  one-shot `WARN` log, so operators can drive the counter to zero
+  before turning compatibility off.
+
+**Test:** `internal/chain/signing_test.go` covers round-trip sign/
+verify under the new domain, rejection of a signature produced with a
+different chainID, rejection of a tampered domain prefix, acceptance +
+counter increment for a legacy-format signature when the compat flag is
+on, and confirms the legacy path is not hit for a correctly-signed new
+transaction.
