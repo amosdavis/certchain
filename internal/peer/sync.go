@@ -1,6 +1,8 @@
 package peer
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,6 +16,10 @@ import (
 
 	"github.com/amosdavis/certchain/internal/chain"
 )
+
+// HMACTagLen is the fixed length of the HMAC-SHA256 authentication tag
+// prepended to every MsgBlockPush body. See CM-28.
+const HMACTagLen = 32
 
 const (
 	// SyncPort is the TCP port for certchain block sync (separate from addrchain's :9877).
@@ -65,6 +71,66 @@ type Syncer struct {
 	// OnNewBlocks is called when a new candidate chain arrives from a peer.
 	// The caller (daemon) should call chain.Replace with the candidate.
 	OnNewBlocks func([]chain.Block)
+
+	// blockSecret is the shared cluster secret used to HMAC-authenticate
+	// MsgBlockPush bodies (CM-28). When empty, the syncer operates in
+	// legacy accept-all mode and logs a single WARN on the first inbound
+	// push so operators notice that peer-push auth is disabled.
+	blockSecret    []byte
+	legacyWarnOnce sync.Once
+}
+
+// SetBlockSecret installs the shared cluster secret used to authenticate
+// peer block-push messages (CM-28). Pass nil or an empty slice to run in
+// legacy accept-all mode. Must be called before Start.
+func (s *Syncer) SetBlockSecret(secret []byte) {
+	if len(secret) == 0 {
+		s.blockSecret = nil
+		return
+	}
+	// Copy so callers can't mutate our internal state after installation.
+	buf := make([]byte, len(secret))
+	copy(buf, secret)
+	s.blockSecret = buf
+}
+
+// computeBlockTag returns the HMAC-SHA256 tag for the given serialised
+// block body. When no secret is configured it returns a zero tag; legacy
+// peers running without a secret simply ignore the tag on receipt.
+func (s *Syncer) computeBlockTag(body []byte) []byte {
+	if len(s.blockSecret) == 0 {
+		return make([]byte, HMACTagLen)
+	}
+	mac := hmac.New(sha256.New, s.blockSecret)
+	mac.Write(body)
+	return mac.Sum(nil)
+}
+
+// verifyBlockTag checks a MsgBlockPush body. The wire format is a fixed
+// 32-byte HMAC-SHA256 tag followed by the JSON-encoded block. When no
+// secret is configured verification is skipped (accept-all) and a single
+// startup WARN is logged; when a secret is configured the tag is
+// compared with hmac.Equal for constant-time equality.
+// Returns the inner JSON body on success.
+func (s *Syncer) verifyBlockTag(body []byte) ([]byte, bool) {
+	if len(body) < HMACTagLen {
+		return nil, false
+	}
+	tag := body[:HMACTagLen]
+	payload := body[HMACTagLen:]
+	if len(s.blockSecret) == 0 {
+		s.legacyWarnOnce.Do(func() {
+			log.Printf("sync: WARN peer block-push HMAC secret not configured — accepting all pushes (CM-28)")
+		})
+		return payload, true
+	}
+	mac := hmac.New(sha256.New, s.blockSecret)
+	mac.Write(payload)
+	expected := mac.Sum(nil)
+	if !hmac.Equal(tag, expected) {
+		return nil, false
+	}
+	return payload, true
 }
 
 // NewSyncer creates a Syncer. configDir is used to locate cached DER files for peer requests.
@@ -271,8 +337,17 @@ func (s *Syncer) handleHello(conn net.Conn, data []byte) {
 }
 
 func (s *Syncer) handleBlockPush(data []byte, remoteAddr net.Addr) {
+	// Wire format (CM-28): 32-byte HMAC-SHA256 tag || JSON(block).
+	payload, ok := s.verifyBlockTag(data)
+	if !ok {
+		log.Printf("sync: block-push HMAC verification FAILED from %s — rejecting (CM-28)", remoteAddr)
+		if host, _, splitErr := net.SplitHostPort(remoteAddr.String()); splitErr == nil {
+			s.table.RecordFailureByIP(host)
+		}
+		return
+	}
 	var b chain.Block
-	if err := json.Unmarshal(data, &b); err != nil {
+	if err := json.Unmarshal(payload, &b); err != nil {
 		return
 	}
 	if err := s.ch.AddBlock(b); err != nil {
@@ -311,7 +386,13 @@ func (s *Syncer) pushBlock(p *Peer, b chain.Block) {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(syncTimeout))
-	_ = writeMsg(conn, MsgBlockPush, b)
+	// Wire format (CM-28): 32-byte HMAC-SHA256 tag || JSON(block).
+	body, err := json.Marshal(b)
+	if err != nil {
+		return
+	}
+	tag := s.computeBlockTag(body)
+	_ = writeRawMsg(conn, MsgBlockPush, append(tag, body...))
 }
 
 func (s *Syncer) syncFromPeer(p *Peer) {
@@ -416,4 +497,20 @@ func readMsg(conn net.Conn) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	return buf[0], buf[1:], nil
+}
+
+// writeRawMsg writes an already-serialised message body (used by the
+// HMAC-authenticated block-push path; see CM-28).
+func writeRawMsg(conn net.Conn, msgType byte, body []byte) error {
+	total := 1 + len(body)
+	hdr := make([]byte, 4)
+	binary.BigEndian.PutUint32(hdr, uint32(total))
+	if _, err := conn.Write(hdr); err != nil {
+		return err
+	}
+	if _, err := conn.Write([]byte{msgType}); err != nil {
+		return err
+	}
+	_, err := conn.Write(body)
+	return err
 }

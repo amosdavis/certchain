@@ -15,6 +15,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -60,8 +61,13 @@ func main() {
 	k8sNamespace    := flag.String("k8s-namespace", "", "Kubernetes namespace for Secrets (default: certchain)")
 	k8sSecretPrefix := flag.String("k8s-secret-prefix", "", "prefix for K8s Secret names (default: cc)")
 	k8sSignerName   := flag.String("k8s-signer-name", "", "CSR signerName to watch (default: certchain.io/appviewx)")
+	enableLegacySecretWriter := flag.Bool("enable-legacy-secret-writer", false, "enable the deprecated certd direct-write Secret path (CM-30); the modern path is the cert-manager external issuer — see docs/MIGRATION-LEGACY-SECRETS.md")
 	metricsAddr     := flag.String("metrics-addr", ":9880", "Address for Prometheus /metrics (H3)")
 	validatorsFile  := flag.String("validators", "", "path to validators.json allowlist (default: <config>/validators.json, CM-23)")
+	peerSecret      := flag.String("peer-secret", "", "shared cluster secret for HMAC-authenticating peer block pushes (CM-28; prefer --peer-secret-file)")
+	peerSecretFile  := flag.String("peer-secret-file", "", "path to a file whose contents are the shared cluster peer-push HMAC secret (CM-28)")
+	queryToken      := flag.String("query-token", "", "Bearer token required on HTTP query API (CM-28; prefer --query-token-file)")
+	queryTokenFile  := flag.String("query-token-file", "", "path to a file whose contents are the Bearer token required on the HTTP query API (CM-28)")
 	chainID          := flag.String("chain-id", chain.DefaultChainID, "chainID mixed into the signature domain separator (CM-29); must match across all peers in a network")
 	acceptLegacySigs := flag.Bool("accept-legacy-sigs", true, "accept signatures in the pre-CM-29 no-domain-separator format; flip to false once all peers have re-signed (CM-29)")
 	flag.Parse()
@@ -79,10 +85,33 @@ func main() {
 	if *k8sNamespace == ""    { *k8sNamespace = os.Getenv("K8S_NAMESPACE") }
 	if *k8sSecretPrefix == "" { *k8sSecretPrefix = os.Getenv("K8S_SECRET_PREFIX") }
 	if *k8sSignerName == ""   { *k8sSignerName = os.Getenv("K8S_SIGNER_NAME") }
+	if !*enableLegacySecretWriter {
+		v := os.Getenv("ENABLE_LEGACY_SECRET_WRITER")
+		*enableLegacySecretWriter = v == "true" || v == "1"
+	}
 	// Apply built-in defaults after env-var resolution.
 	if *k8sNamespace == ""    { *k8sNamespace = "certchain" }
 	if *k8sSecretPrefix == "" { *k8sSecretPrefix = "cc" }
 	if *k8sSignerName == ""   { *k8sSignerName = "certchain.io/appviewx" }
+
+	// CM-28: resolve peer-push HMAC secret and query-API bearer token.
+	// File-based sources take precedence over flag values to keep secrets
+	// off argv; env vars are last-resort so container platforms that wire
+	// Secrets to env (but not files) still work.
+	peerSecretBytes, err := resolveSecret(*peerSecretFile, *peerSecret, "CERTD_PEER_SECRET")
+	if err != nil {
+		log.Fatalf("certd: read peer-secret-file: %v", err)
+	}
+	if len(peerSecretBytes) == 0 {
+		log.Printf("certd: WARN peer block-push HMAC secret not configured — any host in the peer table can inject blocks (CM-28). Set --peer-secret-file in production.")
+	}
+	queryTokenBytes, err := resolveSecret(*queryTokenFile, *queryToken, "CERTD_QUERY_TOKEN")
+	if err != nil {
+		log.Fatalf("certd: read query-token-file: %v", err)
+	}
+	if len(queryTokenBytes) == 0 {
+		log.Printf("certd: WARN HTTP query API bearer token not configured — all query endpoints are unauthenticated (CM-28). Set --query-token-file in production.")
+	}
 
 	id, err := crypto.LoadOrCreate(*configDir)
 	if err != nil {
@@ -142,6 +171,7 @@ func main() {
 
 	// Block sync — OnNewBlocks is set after K8s wiring so triggerK8sSync is ready.
 	syncer := peer.NewSyncer(ch, peerTable, id.PublicKey, *configDir)
+	syncer.SetBlockSecret(peerSecretBytes)
 
 	// blockSubmitter serialises all block submissions (avxPollLoop + CSRWatcher)
 	// behind a single mutex so the per-node nonce stays monotonically increasing.
@@ -167,28 +197,57 @@ func main() {
 		if err != nil {
 			log.Fatalf("certd: k8s in-cluster config: %v", err)
 		}
-		sw := certk8s.NewSecretWriter(k8sClient, *k8sNamespace, *k8sSecretPrefix)
 
-		// Dedicate one goroutine to SecretWriter syncs; a buffered channel
-		// prevents duplicate queued syncs without blocking the caller.
-		k8sSyncTrigger := make(chan struct{}, 1)
-		go func() {
-			for range k8sSyncTrigger {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				if err := sw.Sync(ctx, certStore.List(false), *configDir); err != nil {
-					log.Printf("certd: k8s secret sync: %v", err)
+		// CM-30: the direct-write Secret path is deprecated in favour of the
+		// cert-manager external issuer (cmd/certchain-issuer).  It is gated
+		// behind --enable-legacy-secret-writer so that operators running both
+		// paths concurrently cannot accidentally cause split-brain Secret
+		// ownership.  See docs/MIGRATION-LEGACY-SECRETS.md.
+		if *enableLegacySecretWriter {
+			log.Printf("certd: WARN %s", certk8s.LegacyWriterStartupWarning)
+
+			//lint:ignore SA1019 transitional callsite for legacy writer
+			sw := certk8s.NewSecretWriter(k8sClient, *k8sNamespace, *k8sSecretPrefix)
+
+			// Dedicate one goroutine to SecretWriter syncs; a buffered channel
+			// prevents duplicate queued syncs without blocking the caller.
+			k8sSyncTrigger := make(chan struct{}, 1)
+			go func() {
+				for range k8sSyncTrigger {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					if err := sw.Sync(ctx, certStore.List(false), *configDir); err != nil {
+						log.Printf("certd: k8s secret sync: %v", err)
+					}
+					cancel()
 				}
-				cancel()
+			}()
+			triggerK8sSync = func() {
+				select {
+				case k8sSyncTrigger <- struct{}{}:
+				default: // a sync is already queued; skip
+				}
 			}
-		}()
-		triggerK8sSync = func() {
-			select {
-			case k8sSyncTrigger <- struct{}{}:
-			default: // a sync is already queued; skip
+
+			// Trigger an initial sync so existing secrets are up-to-date at start-up.
+			triggerK8sSync()
+
+			// Drain the trigger channel on shutdown so the sync goroutine exits cleanly.
+			defer close(k8sSyncTrigger)
+		} else {
+			// Legacy writer disabled (default).  The first caller that
+			// would have scheduled a sync gets a one-shot Warn so the
+			// operator sees why Secrets are no longer being written.
+			var legacyWarnOnce sync.Once
+			triggerK8sSync = func() {
+				legacyWarnOnce.Do(func() {
+					log.Printf("certd: WARN %s", certk8s.LegacyWriterDisabledWarning)
+				})
 			}
 		}
 
-		// CSR watcher requires AVX to submit certificates.
+		// CSR watcher requires AVX to submit certificates.  It does not
+		// depend on the legacy Secret writer and runs whenever K8s
+		// integration is enabled.
 		if avxClient != nil {
 			cw := certk8s.NewCSRWatcher(k8sClient, avxClient, id, *k8sSignerName, bs.Submit)
 			cw.Start()
@@ -196,12 +255,6 @@ func main() {
 		} else {
 			log.Printf("certd: K8s CSR watching disabled (--avx-url not set)")
 		}
-
-		// Trigger an initial sync so existing secrets are up-to-date at start-up.
-		triggerK8sSync()
-
-		// Drain the trigger channel on shutdown so the sync goroutine exits cleanly.
-		defer close(k8sSyncTrigger)
 	}
 
 	syncer.OnNewBlocks = func(candidate []chain.Block) {
@@ -231,7 +284,7 @@ func main() {
 	qserver.SetDERFetcher(syncer)
 	httpServer := &http.Server{
 		Addr:         *queryAddr,
-		Handler:      qserver.Handler(),
+		Handler:      queryAuthMiddleware(qserver.Handler(), queryTokenBytes),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -706,4 +759,68 @@ func defaultConfigDir() string {
 		return ".certchain"
 	}
 	return filepath.Join(home, ".certchain")
+}
+
+
+// resolveSecret returns the secret bytes from (in order) a file path,
+// a flag value, or an environment variable. CR/LF trailing characters
+// are trimmed because editors and shells routinely append them. A path
+// that is set but unreadable is fatal — silent fall-through to an empty
+// secret would leave the operator believing the cluster is protected
+// (CM-28). Returns an empty []byte (not nil) when nothing is configured,
+// which callers treat as "disabled, warn once".
+func resolveSecret(filePath, flagVal, envVar string) ([]byte, error) {
+if filePath != "" {
+data, err := os.ReadFile(filePath)
+if err != nil {
+return nil, err
+}
+return bytes.TrimRight(data, "\r\n"), nil
+}
+if flagVal != "" {
+return []byte(strings.TrimRight(flagVal, "\r\n")), nil
+}
+if v := os.Getenv(envVar); v != "" {
+return []byte(strings.TrimRight(v, "\r\n")), nil
+}
+return []byte{}, nil
+}
+
+// queryAuthMiddleware enforces a Bearer token on the HTTP query API.
+// When the configured token is empty, the middleware is a no-op — the
+// endpoints remain open and a one-time WARN has already been logged at
+// startup (CM-28). Health/readiness/metrics endpoints are allowlisted so
+// Kubernetes probes do not require a token; certd actually serves those
+// on a separate mux today but the allowlist is defensive in case the
+// query server gains its own /healthz or /metrics.
+//
+// The token comparison uses crypto/subtle.ConstantTimeCompare to keep
+// the check constant-time and close the timing-attack side channel that
+// a naive string compare would open.
+func queryAuthMiddleware(next http.Handler, token []byte) http.Handler {
+return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+if len(token) == 0 {
+next.ServeHTTP(w, r)
+return
+}
+switch r.URL.Path {
+case "/healthz", "/readyz", "/metrics":
+next.ServeHTTP(w, r)
+return
+}
+authz := r.Header.Get("Authorization")
+const prefix = "Bearer "
+if !strings.HasPrefix(authz, prefix) {
+w.Header().Set("WWW-Authenticate", `Bearer realm="certd"`)
+http.Error(w, "unauthorized", http.StatusUnauthorized)
+return
+}
+provided := []byte(authz[len(prefix):])
+if subtle.ConstantTimeCompare(provided, token) != 1 {
+w.Header().Set("WWW-Authenticate", `Bearer realm="certd", error="invalid_token"`)
+http.Error(w, "unauthorized", http.StatusUnauthorized)
+return
+}
+next.ServeHTTP(w, r)
+})
 }
