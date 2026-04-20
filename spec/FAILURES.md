@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-33)
+# certchain Failure Mode Tenets (CM-01 to CM-34)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -883,3 +883,52 @@ increments `certchain_annotation_errors_total` plus emits a
 `CertchainSecretError` Event, and (e) `NotFound` from certd is
 not counted as an error because it's the expected state during
 initial issuance.
+
+---
+
+### CM-34 — Coarse-Grained Submit Mutex Serializes Unrelated Chain Operations and Collapses Under Batch Load
+
+**Risk:** The pre-CM-34 `BatchSubmit` implementation held a single
+write-lock across the entire operation (tx copy → build block → hash →
+validate → apply seq/rate → append). When the C5 Batcher feeds Submit
+under sustained load (proactive renewal sweeps, CSR bursts), all
+concurrent submit calls serialize even when they could safely run
+validation and block construction in parallel. This degrades throughput
+in proportion to validation cost (signature checks, payload parsing),
+creates unnecessary head-of-line blocking in peer submission paths, and
+wastes CPU idle time that could be doing useful work. Additionally, if
+future work (H7 WAL persistence, peer broadcast) performs I/O inside the
+critical section, the lock hold time grows linearly with disk latency
+and network RTT, magnifying the serialization penalty.
+
+**Mitigation:**
+- The chain struct already uses `sync.RWMutex`. All read paths (`Len`,
+  `Tip`, `GetBlock`, `GetBlocks`, `GenesisHash`, `Validators`,
+  `ChainID`, `AcceptsLegacySigs`) acquire `RLock` and can proceed
+  concurrently with each other.
+- `BatchSubmit` acquires the write-lock ONLY for the
+  append-and-advance-head linearization point (the critical section that
+  actually mutates `c.blocks`, `c.seqMap`, `c.rateMap`). Block
+  construction, hashing, and validation now happen outside the lock:
+    1. Snapshot the current tip under `RLock`.
+    2. Build the candidate block in local memory (copy txs, compute hash).
+    3. Call `validateBlockUnlocked`, which snapshots validators and
+       chain state (`seqMap`, `rateMap`) under `RLock` and validates the
+       candidate without holding any lock during signature verification,
+       payload parse, or rate-limit checks.
+    4. Acquire `Lock`, re-check the tip hasn't advanced (retry if stale),
+       apply seq/rate updates, append, release lock.
+- Multiple concurrent `BatchSubmit` calls can construct and validate
+  blocks in parallel. Only the final append is serialized, so lock hold
+  time is constant (map writes + slice append) and independent of I/O.
+- When H7 wires WAL persistence and peer broadcast, those operations
+  run outside the lock: persistence happens before the lock is acquired
+  (with a rollback path if the tip-check fails), and broadcast happens
+  after the lock is released. This keeps the critical section bounded.
+
+**Test:** Existing `internal/chain/chain_test.go`,
+`internal/chain/batcher_test.go`, and `internal/chain/submit.go` tests
+continue to pass with `go test -race -count=1 ./internal/chain/...` to
+verify race-freedom. A future benchmark `BenchmarkSubmitParallel` may
+be added to quantify the throughput improvement, but is not required for
+correctness.

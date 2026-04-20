@@ -22,7 +22,7 @@ type Chain struct {
 	blocks     []Block
 	seqMap     map[[32]byte]uint32  // last seen nonce per node pubkey
 	rateMap    map[[32]byte][]int64 // block indices of recent txs per node
-	validators *ValidatorSet       // nil = accept any signer (CM-23)
+	validators *ValidatorSet        // nil = accept any signer (CM-23)
 
 	// chainID and acceptLegacySigs reflect the signing context installed
 	// by New (CM-29). They are recorded here so callers can introspect
@@ -236,6 +236,70 @@ func (c *Chain) Prune(keepFrom uint32) int {
 }
 
 // ---- validation (called with lock held or from validateChain) ----
+
+// validateBlockUnlocked validates a block against a snapshot of chain state
+// (prev block, seqMap, rateMap) WITHOUT holding c.mu. The snapshot must be
+// taken under RLock. This is used by BatchSubmit to validate outside the
+// critical section (CM-34).
+func (c *Chain) validateBlockUnlocked(b, prev Block) error {
+	if b.Index != prev.Index+1 {
+		return errors.New("block index is not sequential")
+	}
+	if b.PrevHash != prev.Hash {
+		return errors.New("prev_hash mismatch")
+	}
+	expected := ComputeHash(&b)
+	if b.Hash != expected {
+		return errors.New("block hash mismatch")
+	}
+
+	// Snapshot validator set and chain state for validation.
+	c.mu.RLock()
+	vs := c.validators
+	seqMap := make(map[[32]byte]uint32, len(c.seqMap))
+	for k, v := range c.seqMap {
+		seqMap[k] = v
+	}
+	rateMap := make(map[[32]byte][]int64, len(c.rateMap))
+	for k, v := range c.rateMap {
+		rateMap[k] = append([]int64(nil), v...)
+	}
+	c.mu.RUnlock()
+
+	// Validate each tx against the snapshot.
+	for i := range b.Txs {
+		tx := &b.Txs[i]
+		if !vs.Contains(tx.NodePubkey) {
+			return ErrUnauthorizedAuthor
+		}
+		if err := Verify(tx); err != nil {
+			return err
+		}
+		if err := ValidatePayload(tx); err != nil {
+			return err
+		}
+
+		// Replay protection.
+		last, seen := seqMap[tx.NodePubkey]
+		if seen && tx.Nonce <= last {
+			return errors.New("transaction nonce replay detected")
+		}
+
+		// Rate limiting.
+		indices := rateMap[tx.NodePubkey]
+		cutoff := int64(b.Index) - rateLimitWindow
+		active := 0
+		for _, idx := range indices {
+			if idx > cutoff {
+				active++
+			}
+		}
+		if active >= rateLimitMax {
+			return errors.New("rate limit exceeded")
+		}
+	}
+	return nil
+}
 
 func (c *Chain) validateBlock(b, prev Block) error {
 	if b.Index != prev.Index+1 {

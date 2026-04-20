@@ -38,6 +38,10 @@ func (c *Chain) Submit(ctx context.Context, tx Transaction) (Block, error) {
 // ctx is honoured as a pre-commit cancellation signal; once the chain
 // mutex has been acquired and validation has started, ctx is no longer
 // consulted so that partial state changes cannot occur.
+//
+// Locking strategy (CM-34): The write lock is held ONLY for the
+// append-and-advance-head linearization point. Block construction and
+// validation run outside the critical section where safe.
 func (c *Chain) BatchSubmit(ctx context.Context, txs []Transaction) (Block, error) {
 	if len(txs) == 0 {
 		return Block{}, ErrEmptyBatch
@@ -53,10 +57,12 @@ func (c *Chain) BatchSubmit(ctx context.Context, txs []Transaction) (Block, erro
 	localTxs := make([]Transaction, len(txs))
 	copy(localTxs, txs)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Snapshot the chain tip under RLock to build the candidate block.
+	// Multiple Submit calls can prepare blocks concurrently.
+	c.mu.RLock()
 	prev := c.blocks[len(c.blocks)-1]
+	c.mu.RUnlock()
+
 	blk := Block{
 		Index:     prev.Index + 1,
 		Timestamp: Now(),
@@ -65,9 +71,26 @@ func (c *Chain) BatchSubmit(ctx context.Context, txs []Transaction) (Block, erro
 	}
 	blk.Hash = ComputeHash(&blk)
 
-	if err := c.validateBlock(blk, prev); err != nil {
+	// Validate the candidate block against the snapshot. Validation is
+	// pure computation with no I/O, so can happen outside the lock.
+	// NOTE: validators are read under RLock in validateBlock via Contains.
+	if err := c.validateBlockUnlocked(blk, prev); err != nil {
 		return Block{}, err
 	}
+
+	// Critical section: acquire write lock, re-check tip hasn't advanced,
+	// apply seq/rate updates, and append. This is the linearization point
+	// for all concurrent Submit calls.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	currentTip := c.blocks[len(c.blocks)-1]
+	if currentTip.Hash != prev.Hash {
+		// Another Submit won the race; our candidate is stale.
+		// Caller can retry (Batcher will do this automatically).
+		return Block{}, errors.New("chain tip advanced during submit; retry")
+	}
+
 	c.applySeqAndRate(blk)
 	c.blocks = append(c.blocks, blk)
 	return blk, nil
