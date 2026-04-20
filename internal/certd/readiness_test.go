@@ -1,4 +1,4 @@
-package main
+package certd
 
 import (
 	"encoding/json"
@@ -17,7 +17,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 
 	t.Run("chain_not_loaded_returns_503_with_json", func(t *testing.T) {
 		t.Parallel()
-		r := newCertdReadiness()
+		r := NewReadiness()
 
 		resp := serveCertdReadyz(t, r)
 		if resp.Code != http.StatusServiceUnavailable {
@@ -37,7 +37,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 
 	t.Run("chain_loaded_and_leader_disabled_returns_200", func(t *testing.T) {
 		t.Parallel()
-		r := newCertdReadiness()
+		r := NewReadiness()
 		r.SetChainLoaded(true)
 
 		resp := serveCertdReadyz(t, r)
@@ -52,7 +52,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 
 	t.Run("leader_enabled_but_not_acquired_returns_503", func(t *testing.T) {
 		t.Parallel()
-		r := newCertdReadiness()
+		r := NewReadiness()
 		r.SetChainLoaded(true)
 		r.EnableLeader(true)
 
@@ -67,7 +67,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 
 	t.Run("leader_acquired_and_chain_loaded_returns_200", func(t *testing.T) {
 		t.Parallel()
-		r := newCertdReadiness()
+		r := NewReadiness()
 		r.SetChainLoaded(true)
 		r.EnableLeader(true)
 		r.SetLeader(true)
@@ -80,7 +80,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 
 	t.Run("handler_responds_well_under_50ms", func(t *testing.T) {
 		t.Parallel()
-		r := newCertdReadiness()
+		r := NewReadiness()
 		start := time.Now()
 		_ = serveCertdReadyz(t, r)
 		if d := time.Since(start); d > 50*time.Millisecond {
@@ -89,7 +89,7 @@ func TestCertdReadinessHandler(t *testing.T) {
 	})
 }
 
-func serveCertdReadyz(t *testing.T, r *certdReadiness) *httptest.ResponseRecorder {
+func serveCertdReadyz(t *testing.T, r *Readiness) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()

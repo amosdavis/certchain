@@ -1,4 +1,4 @@
-package main
+package certd
 
 import (
 	"net/http"
