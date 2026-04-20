@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
@@ -1381,8 +1382,13 @@ func (w *world) theCertificateRequestAlreadyHasStatusCertificateSet() {
 		w.lastErr = fmt.Errorf("no CertificateRequest %s", key)
 		return
 	}
-	fakeCert := base64.StdEncoding.EncodeToString([]byte("existing-cert-pem"))
-	_ = unstructured.SetNestedField(cr.Object, fakeCert, "status", "certificate")
+	cn := certRequestCSRCN(cr)
+	existingPEM, err := generateEphemeralCertPEM(cn)
+	if err != nil {
+		w.lastErr = fmt.Errorf("generate existing cert: %w", err)
+		return
+	}
+	_ = unstructured.SetNestedField(cr.Object, base64.StdEncoding.EncodeToString(existingPEM), "status", "certificate")
 }
 
 // theK8sCSRStatusCertificateIsPrePopulated pre-populates the K8s CSR that the
@@ -1481,8 +1487,19 @@ func (w *world) theIssuerProcessesTheCertificateRequest() {
 			w.lastErr = fmt.Errorf("get K8s CSR to populate cert: %w", err)
 			return
 		}
-		fakeCert := []byte("fake-issued-cert-pem")
-		k8sCsr.Status.Certificate = fakeCert
+		// Parse the original CSR to recover its CommonName so the issued cert
+		// binds to the same subject the client requested.
+		parsedCSR, err := x509.ParseCertificateRequest(csrDER)
+		if err != nil {
+			w.lastErr = fmt.Errorf("parse CSR DER: %w", err)
+			return
+		}
+		issuedCertPEM, err := generateEphemeralCertPEM(parsedCSR.Subject.CommonName)
+		if err != nil {
+			w.lastErr = fmt.Errorf("generate ephemeral cert: %w", err)
+			return
+		}
+		k8sCsr.Status.Certificate = issuedCertPEM
 		if _, err := w.k8sClient.CertificatesV1().CertificateSigningRequests().UpdateStatus(
 			ctx, k8sCsr, metav1.UpdateOptions{}); err != nil {
 			w.lastErr = fmt.Errorf("populate K8s CSR cert: %w", err)
@@ -1491,7 +1508,7 @@ func (w *world) theIssuerProcessesTheCertificateRequest() {
 
 		setCRCondition(cr, "Approved", "True", "CertchainIssued", "Issued by certchain")
 		setCRCondition(cr, "Ready", "True", "Issued", "Certificate is issued")
-		_ = unstructured.SetNestedField(cr.Object, base64.StdEncoding.EncodeToString(fakeCert), "status", "certificate")
+		_ = unstructured.SetNestedField(cr.Object, base64.StdEncoding.EncodeToString(issuedCertPEM), "status", "certificate")
 	}
 }
 
@@ -1588,9 +1605,30 @@ func (w *world) theCertificateRequestStatusCertificateIsSet() error {
 	if cr == nil {
 		return fmt.Errorf("no CertificateRequest %s/%s", w.lastCRNamespace, w.lastCRName)
 	}
-	cert, _, _ := unstructured.NestedString(cr.Object, "status", "certificate")
-	if cert == "" {
+	certField, _, _ := unstructured.NestedString(cr.Object, "status", "certificate")
+	if certField == "" {
 		return fmt.Errorf("CertificateRequest %s/%s status.certificate is not set", w.lastCRNamespace, w.lastCRName)
+	}
+	// Decode and parse the issued certificate to ensure the issuer wrote a
+	// real X.509 cert bound to the Subject the client requested.
+	pemBytes, err := base64.StdEncoding.DecodeString(certField)
+	if err != nil {
+		return fmt.Errorf("CertificateRequest %s/%s status.certificate is not valid base64: %w",
+			w.lastCRNamespace, w.lastCRName, err)
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return fmt.Errorf("CertificateRequest %s/%s status.certificate is not a PEM CERTIFICATE block",
+			w.lastCRNamespace, w.lastCRName)
+	}
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse issued certificate: %w", err)
+	}
+	wantCN := certRequestCSRCN(cr)
+	if wantCN != "" && parsed.Subject.CommonName != wantCN {
+		return fmt.Errorf("issued certificate CN = %q, want %q",
+			parsed.Subject.CommonName, wantCN)
 	}
 	return nil
 }
@@ -1745,4 +1783,56 @@ func TestBDD(t *testing.T) {
 // TestMain allows running godog from "go test".
 func TestMain(m *testing.M) {
 	os.Exit(m.Run())
+}
+
+// generateEphemeralCertPEM generates a real, self-signed, ephemeral ECDSA P-256
+// X.509 certificate with Subject.CommonName=cn, valid for one hour. It returns
+// the PEM-encoded certificate ready to be written into a K8s CSR's
+// status.certificate or a cert-manager CertificateRequest's status.certificate.
+//
+// This exists so BDD tests exercise real x509 parsing paths rather than
+// asserting on placeholder byte strings.
+func generateEphemeralCertPEM(cn string) ([]byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ecdsa.GenerateKey: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("serial: %w", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, fmt.Errorf("x509.CreateCertificate: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+}
+
+// certRequestCSRCN extracts the CommonName from the CSR DER stored at
+// spec.request on a cert-manager CertificateRequest unstructured object.
+// Returns "" if the CSR can't be parsed (callers treat empty as "skip check").
+func certRequestCSRCN(cr *unstructured.Unstructured) string {
+	csrB64, _, _ := unstructured.NestedString(cr.Object, "spec", "request")
+	if csrB64 == "" {
+		return ""
+	}
+	der, err := base64.StdEncoding.DecodeString(csrB64)
+	if err != nil {
+		return ""
+	}
+	parsed, err := x509.ParseCertificateRequest(der)
+	if err != nil {
+		return ""
+	}
+	return parsed.Subject.CommonName
 }
