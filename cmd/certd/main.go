@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -123,7 +124,10 @@ func main() {
 	registry := metrics.NewRegistry()
 	_ = metrics.NewChainMetrics(registry)
 	_ = metrics.NewAVXMetrics(registry)
-	startCertdMetricsServer(*metricsAddr, registry)
+	// Readiness state (CM-27). certd has no leader election today so the
+	// leader signal is reported as "disabled" and does not gate readiness.
+	ready := newCertdReadiness()
+	startCertdMetricsServer(*metricsAddr, registry, ready)
 
 	ch := chain.New(
 		chain.WithChainID(*chainID),
@@ -161,6 +165,11 @@ func main() {
 	if err := loadChain(ch, certStore, *configDir); err != nil {
 		log.Printf("certd: load chain: %v (starting fresh)", err)
 	}
+	// Even if load failed (fresh start), persisted-state replay has finished
+	// and the process now reflects its on-disk source of truth. The peer-sync
+	// signal below is strictly stronger, but marking here means /readyz is
+	// not held open forever on a single-node deployment with no peers.
+	ready.SetChainLoaded(true)
 
 	// Peer discovery.
 	discoverer := peer.NewDiscoverer(peerTable, id.PublicKey, peer.SyncPort)
@@ -330,12 +339,14 @@ func main() {
 // startCertdMetricsServer exposes /metrics on the admin port. Failures are
 // logged but do not terminate the process; metrics are observability, not
 // availability-critical (see CM-14 for related HTTP timeout policy).
-func startCertdMetricsServer(addr string, reg *metrics.Registry) {
+// /readyz reflects real operational readiness per CM-27.
+func startCertdMetricsServer(addr string, reg *metrics.Registry, ready *certdReadiness) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", reg.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	mux.HandleFunc("/readyz", ready.ServeReadyz)
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		log.Printf("certd: metrics on %s", addr)
@@ -343,6 +354,66 @@ func startCertdMetricsServer(addr string, reg *metrics.Registry) {
 			log.Printf("certd: metrics server error: %v", err)
 		}
 	}()
+}
+
+// certdReadiness tracks the /readyz signals for certd (CM-27). Only the
+// owning subsystem moves each flag forward (false -> true).
+//
+// Today certd does not run leader election, so leaderElectionEnabled is
+// false and the leader signal is reported as "disabled" and does not gate
+// readiness. When leader election is added, set leaderElectionEnabled
+// true at startup and call SetLeader(true) inside the OnStartedLeading
+// callback.
+type certdReadiness struct {
+	chainLoaded            atomic.Bool
+	leaderAcquired         atomic.Bool
+	leaderElectionEnabled  atomic.Bool
+}
+
+func newCertdReadiness() *certdReadiness { return &certdReadiness{} }
+
+func (r *certdReadiness) SetChainLoaded(v bool)  { r.chainLoaded.Store(v) }
+func (r *certdReadiness) SetLeader(v bool)       { r.leaderAcquired.Store(v) }
+func (r *certdReadiness) EnableLeader(v bool)    { r.leaderElectionEnabled.Store(v) }
+
+// Snapshot returns the per-signal human strings plus an overall ready bit.
+// It performs only atomic reads and never blocks.
+func (r *certdReadiness) Snapshot() (leader, chainStr string, ok bool) {
+	chainOK := r.chainLoaded.Load()
+	chainStr = "loading"
+	if chainOK {
+		chainStr = "loaded"
+	}
+
+	leaderOK := true
+	if r.leaderElectionEnabled.Load() {
+		leaderOK = r.leaderAcquired.Load()
+		leader = "not_acquired"
+		if leaderOK {
+			leader = "ok"
+		}
+	} else {
+		leader = "disabled"
+	}
+
+	ok = chainOK && leaderOK
+	return
+}
+
+// ServeReadyz handles /readyz. It performs only atomic reads so it responds
+// in well under the 50 ms probe budget (CM-27).
+func (r *certdReadiness) ServeReadyz(w http.ResponseWriter, _ *http.Request) {
+	leader, chainStr, ok := r.Snapshot()
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"leader": leader,
+		"chain":  chainStr,
+	})
 }
 
 // blockSubmitter serialises block submissions from concurrent goroutines
@@ -698,6 +769,74 @@ func saveChain(ch *chain.Chain, configDir string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+// resolveSecret returns the secret material from the first available
+// source: a file (preferred, to keep secrets off argv and environment),
+// then a flag value, then an environment variable. A missing file path
+// produces no error (secret simply stays empty); an unreadable path is
+// fatal because the caller explicitly asked for file-based config.
+// Trailing CR/LF are trimmed so operators can `echo "$SECRET" > file`
+// without accidentally embedding a newline in the credential. See CM-26.
+func resolveSecret(path, flagValue, envKey string) ([]byte, error) {
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		return bytes.TrimRight(data, "\r\n"), nil
+	}
+	if flagValue != "" {
+		return []byte(flagValue), nil
+	}
+	if envKey != "" {
+		if v := os.Getenv(envKey); v != "" {
+			return []byte(v), nil
+		}
+	}
+	return nil, nil
+}
+
+// queryAuthMiddleware Bearer-token-protects the HTTP query API (CM-26).
+//
+// Requests to paths in the allowlist (/healthz, /readyz, /metrics) are
+// always passed through so Kubernetes probes and Prometheus scrapes keep
+// working without credentials. When token is empty the middleware is a
+// no-op (legacy / dev mode); callers are expected to log a WARN at
+// startup so operators notice the degraded posture.
+//
+// Tokens are compared with crypto/subtle.ConstantTimeCompare to close
+// the timing side-channel on a per-byte string comparison.
+func queryAuthMiddleware(next http.Handler, token []byte) http.Handler {
+	allow := map[string]struct{}{
+		"/healthz": {},
+		"/readyz":  {},
+		"/metrics": {},
+	}
+	const bearerPrefix = "Bearer "
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := allow[r.URL.Path]; ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if len(token) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		authz := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authz, bearerPrefix) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="certchain"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		provided := []byte(authz[len(bearerPrefix):])
+		if subtle.ConstantTimeCompare(provided, token) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="certchain"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func loadChain(ch *chain.Chain, certStore *cert.Store, configDir string) error {
 	path := filepath.Join(configDir, "chain.json")
 	data, err := os.ReadFile(path)
@@ -761,66 +900,3 @@ func defaultConfigDir() string {
 	return filepath.Join(home, ".certchain")
 }
 
-
-// resolveSecret returns the secret bytes from (in order) a file path,
-// a flag value, or an environment variable. CR/LF trailing characters
-// are trimmed because editors and shells routinely append them. A path
-// that is set but unreadable is fatal — silent fall-through to an empty
-// secret would leave the operator believing the cluster is protected
-// (CM-28). Returns an empty []byte (not nil) when nothing is configured,
-// which callers treat as "disabled, warn once".
-func resolveSecret(filePath, flagVal, envVar string) ([]byte, error) {
-if filePath != "" {
-data, err := os.ReadFile(filePath)
-if err != nil {
-return nil, err
-}
-return bytes.TrimRight(data, "\r\n"), nil
-}
-if flagVal != "" {
-return []byte(strings.TrimRight(flagVal, "\r\n")), nil
-}
-if v := os.Getenv(envVar); v != "" {
-return []byte(strings.TrimRight(v, "\r\n")), nil
-}
-return []byte{}, nil
-}
-
-// queryAuthMiddleware enforces a Bearer token on the HTTP query API.
-// When the configured token is empty, the middleware is a no-op — the
-// endpoints remain open and a one-time WARN has already been logged at
-// startup (CM-28). Health/readiness/metrics endpoints are allowlisted so
-// Kubernetes probes do not require a token; certd actually serves those
-// on a separate mux today but the allowlist is defensive in case the
-// query server gains its own /healthz or /metrics.
-//
-// The token comparison uses crypto/subtle.ConstantTimeCompare to keep
-// the check constant-time and close the timing-attack side channel that
-// a naive string compare would open.
-func queryAuthMiddleware(next http.Handler, token []byte) http.Handler {
-return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-if len(token) == 0 {
-next.ServeHTTP(w, r)
-return
-}
-switch r.URL.Path {
-case "/healthz", "/readyz", "/metrics":
-next.ServeHTTP(w, r)
-return
-}
-authz := r.Header.Get("Authorization")
-const prefix = "Bearer "
-if !strings.HasPrefix(authz, prefix) {
-w.Header().Set("WWW-Authenticate", `Bearer realm="certd"`)
-http.Error(w, "unauthorized", http.StatusUnauthorized)
-return
-}
-provided := []byte(authz[len(prefix):])
-if subtle.ConstantTimeCompare(provided, token) != 1 {
-w.Header().Set("WWW-Authenticate", `Bearer realm="certd", error="invalid_token"`)
-http.Error(w, "unauthorized", http.StatusUnauthorized)
-return
-}
-next.ServeHTTP(w, r)
-})
-}

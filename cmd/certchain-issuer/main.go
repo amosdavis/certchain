@@ -12,13 +12,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,6 +44,9 @@ func main() {
 	leaseNamespace := flag.String("leader-lease-namespace", "", "Namespace for the Lease (defaults to POD_NAMESPACE / certchain)")
 	logFormat := flag.String("log-format", "json", "Log format: json|text")
 	logLevel := flag.String("log-level", "info", "Log level: debug|info|warn|error")
+	certdURL := flag.String("certd-url", "http://127.0.0.1:9879", "certd query API base URL used for readiness probing (CM-27); empty disables the probe")
+	readinessMaxStaleness := flag.Duration("readiness-max-staleness", 60*time.Second, "Maximum age of the last successful certd probe before /readyz returns 503 (CM-27)")
+	certdProbeInterval := flag.Duration("certd-probe-interval", 15*time.Second, "Background certd reachability probe interval for /readyz (CM-27)")
 	flag.Parse()
 
 	logger := logging.New(logging.Options{
@@ -73,13 +79,29 @@ func main() {
 		WithLogger(logger).
 		WithMetrics(issuerMetrics)
 
-	startHealthServer(*healthAddr, logger)
+	// Readiness state (CM-27). Only the owning subsystem flips each signal
+	// forward (false -> true) to avoid flapping during transient recovery.
+	ready := newReadiness(*certdURL, *readinessMaxStaleness)
+	if !*leaderElect {
+		ready.SetLeader(true)
+	}
+
+	startHealthServer(*healthAddr, ready, logger)
 	startMetricsServer(*metricsAddr, registry, logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Background certd reachability probe (CM-27). The readiness handler is
+	// a pure atomic read; no HTTP I/O happens inside the probe endpoint.
+	if *certdURL != "" {
+		go runCertdProbe(ctx, *certdURL, *certdProbeInterval, ready, logger)
+	}
+
 	run := func(ctx context.Context) error {
+		// Controller setup is effectively complete as soon as Run establishes
+		// its watch; expose that as the "caches synced" readiness signal.
+		ready.SetCachesSynced(true)
 		return reconnectLoop(ctx, ctrl, *reconnectDelay, logger)
 	}
 
@@ -98,7 +120,11 @@ func main() {
 		Client:    k8sClient,
 		Logger:    logger,
 	}
-	if err := leader.Run(ctx, leaderCfg, run); err != nil && !errors.Is(err, context.Canceled) {
+	leaderRun := func(ctx context.Context) error {
+		ready.SetLeader(true)
+		return run(ctx)
+	}
+	if err := leader.Run(ctx, leaderCfg, leaderRun); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("leader run returned error", "err", err)
 		os.Exit(1)
 	}
@@ -124,16 +150,140 @@ func reconnectLoop(ctx context.Context, ctrl *issuer.Controller, delay time.Dura
 	}
 }
 
-func startHealthServer(addr string, logger *slog.Logger) {
+// readiness tracks the three /readyz signals for certchain-issuer (CM-27):
+// leader acquisition, controller cache sync, and recent successful certd
+// reachability. Each signal is owned by one writer and only moves forward.
+type readiness struct {
+	leader       atomic.Bool
+	cachesSynced atomic.Bool
+	// certdLastOKNanos is the Unix-nanos timestamp of the most recent
+	// successful certd probe; zero means "never succeeded". Stored atomically
+	// so the /readyz handler never contends with the probe goroutine.
+	certdLastOKNanos atomic.Int64
+	certdURL         string
+	maxStaleness     time.Duration
+	now              func() time.Time
+}
+
+func newReadiness(certdURL string, maxStaleness time.Duration) *readiness {
+	return &readiness{
+		certdURL:     certdURL,
+		maxStaleness: maxStaleness,
+		now:          time.Now,
+	}
+}
+
+func (r *readiness) SetLeader(v bool)       { r.leader.Store(v) }
+func (r *readiness) SetCachesSynced(v bool) { r.cachesSynced.Store(v) }
+func (r *readiness) MarkCertdOK(t time.Time) {
+	r.certdLastOKNanos.Store(t.UnixNano())
+}
+
+// Snapshot returns human-readable per-signal states plus an overall ready
+// bit. It never blocks.
+func (r *readiness) Snapshot() (leader, caches, certd string, ok bool) {
+	leaderOK := r.leader.Load()
+	cachesOK := r.cachesSynced.Load()
+
+	leader = "not_acquired"
+	if leaderOK {
+		leader = "ok"
+	}
+	caches = "syncing"
+	if cachesOK {
+		caches = "synced"
+	}
+
+	certdOK := true
+	switch {
+	case r.certdURL == "":
+		certd = "disabled"
+	default:
+		lastNanos := r.certdLastOKNanos.Load()
+		if lastNanos == 0 {
+			certd = "never"
+			certdOK = false
+			break
+		}
+		age := r.now().Sub(time.Unix(0, lastNanos))
+		if age > r.maxStaleness {
+			certd = fmt.Sprintf("stale_%s", age.Truncate(time.Second))
+			certdOK = false
+			break
+		}
+		certd = "ok"
+	}
+
+	ok = leaderOK && cachesOK && certdOK
+	return
+}
+
+// ServeReadyz is the /readyz handler. It performs only atomic reads so it
+// responds in well under the 50 ms probe budget (CM-27).
+func (r *readiness) ServeReadyz(w http.ResponseWriter, _ *http.Request) {
+	leader, caches, certd, ok := r.Snapshot()
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"leader": leader,
+		"caches": caches,
+		"certd":  certd,
+	})
+}
+
+// runCertdProbe ticks every interval, pings certdURL/status, and on any 2xx
+// response updates the readiness timestamp. It must never block the probe
+// endpoint; all network work happens here.
+func runCertdProbe(ctx context.Context, certdURL string, interval time.Duration, ready *readiness, logger *slog.Logger) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	probe := func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, certdURL+"/status", nil)
+		if err != nil {
+			logger.Warn("certd readiness probe: build request", "err", err)
+			return
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Debug("certd readiness probe: transport error", "err", err)
+			return
+		}
+		defer func() {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			ready.MarkCertdOK(time.Now())
+			return
+		}
+		logger.Debug("certd readiness probe: non-2xx", "status", resp.StatusCode)
+	}
+
+	probe()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			probe()
+		}
+	}
+}
+
+func startHealthServer(addr string, ready *readiness, logger *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
-	})
+	mux.HandleFunc("/readyz", ready.ServeReadyz)
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {

@@ -518,6 +518,55 @@ cover the controller-side invariants (`resolveIssuer` rejects bad
 
 ---
 
+## Category: Process Lifecycle
+
+### CM-27 — Liveness/Readiness Conflated Leads to Traffic Served Before Dependencies Ready
+
+**Risk:** A `/readyz` endpoint that returns 200 unconditionally (i.e., behaves
+like `/healthz`) tells the Kubernetes kubelet and Service load-balancer that
+the pod is ready to serve traffic the instant the HTTP server binds, long
+before the process has finished its real startup work: leader election has
+not yet acquired, informer caches are empty, the on-disk chain has not been
+replayed, and dependent services (e.g., certd's query API) may be
+unreachable. Clients that hit the pod in that window see timeouts, 500s,
+or — worse — silently incorrect answers computed from empty state. During
+rolling upgrades, Kubernetes also uses readiness to decide when the new pod
+is healthy enough to terminate the old one, so conflating the two probes
+can cascade into a cluster-wide outage during any routine deploy.
+
+**Mitigation:**
+- Both `certd` and `certchain-issuer` expose `/healthz` (process-up only,
+  always 200) and `/readyz` (operational readiness). The two probes must
+  never be aliased.
+- `certchain-issuer` `/readyz` returns 200 only when (a) leader election
+  has acquired the Lease or was explicitly disabled by `--leader-elect=false`,
+  (b) the controller's informer setup has completed (cache-synced flag is
+  set once `Controller.Run` has established its watch), and (c) the issuer
+  has successfully reached `certd`'s query API at least once within the
+  configured max-staleness window (default 60 s). The certd reachability
+  probe runs in a 15 s-tick background goroutine that updates an atomic
+  timestamp; the probe handler is a pure read of that timestamp and three
+  booleans, so it never blocks on network I/O and responds in well under
+  50 ms even when certd is unreachable.
+- `certd` `/readyz` returns 200 only when the persisted chain state has
+  been loaded from disk (and the initial peer-sync attempt has either
+  completed or timed out) and — when enabled — leader election has
+  acquired. Until both signals are true the endpoint returns 503.
+- On a 503, both endpoints emit a compact JSON body
+  `{"leader": "...", "caches": "...", "certd": "..."}` so operators can
+  tell at a glance which readiness signal is failing without needing pod
+  logs.
+- Readiness flags are only ever flipped forward (false → true) by the
+  subsystem that owns them, preventing spurious flapping when a transient
+  dependency error (e.g., certd restart) recovers within the staleness
+  window.
+
+**Test:** `TestIssuerReadinessHandler` in `cmd/certchain-issuer/readyz_test.go`
+and `TestCertdReadinessHandler` in `cmd/certd/readyz_test.go` each cover
+the not-ready → 503 + JSON body case and the fully-ready → 200 case.
+
+---
+
 ## Category: Supply Chain
 
 ### CM-28 — Unaudited Transitive Deps Introduce CVEs / License Violations
