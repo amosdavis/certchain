@@ -36,6 +36,7 @@ type BlockSubmitter struct {
 	certStore *cert.Store
 	syncer    *peer.Syncer
 	configDir string
+	walPath   string
 	batcher   *chain.Batcher
 	logger    *slog.Logger
 }
@@ -43,13 +44,14 @@ type BlockSubmitter struct {
 // NewBlockSubmitter creates a BlockSubmitter that batches transactions
 // through a chain.Batcher. It resumes the nonce from the chain to avoid
 // replay.
-func NewBlockSubmitter(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir string, batchMaxTxs int, batchMaxWait time.Duration) *BlockSubmitter {
+func NewBlockSubmitter(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, id *crypto.Identity, syncer *peer.Syncer, configDir, walPath string, batchMaxTxs int, batchMaxWait time.Duration) *BlockSubmitter {
 	bs := &BlockSubmitter{
 		ch:        ch,
 		certStore: certStore,
 		id:        id,
 		syncer:    syncer,
 		configDir: configDir,
+		walPath:   walPath,
 		logger:    logger,
 	}
 	// Resume nonce from chain to avoid replay (monotonic per-node).
@@ -97,7 +99,7 @@ func (bs *BlockSubmitter) onBlockCommitted(blk chain.Block) {
 		log.Printf("certd: cert store apply block: %v", err)
 	}
 	bs.syncer.PushBlockToPeers(blk)
-	_ = SaveChain(context.Background(), bs.logger, bs.ch, bs.configDir)
+	_ = SaveChain(context.Background(), bs.logger, bs.ch, bs.configDir, bs.walPath)
 }
 
 // Submit adds a transaction to the chain via the Batcher. tx must have

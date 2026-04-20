@@ -17,14 +17,21 @@ type persistedChain struct {
 }
 
 // LoadChain loads the persisted chain from configDir/chain.json and
-// replaces the chain's blocks if the file exists. It rebuilds the cert
-// store from the loaded blocks. Returns nil if the file doesn't exist
-// (fresh start).
-func LoadChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, configDir string) error {
+// replays the WAL on top if walPath is provided. It replaces the chain's
+// blocks if the file exists and rebuilds the cert store from the loaded
+// blocks. Returns nil if the snapshot file doesn't exist (fresh start).
+func LoadChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certStore *cert.Store, configDir, walPath string) error {
+	// Load the snapshot
 	path := filepath.Join(configDir, "chain.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return nil
+		// Fresh start; if WAL exists, replay it
+		if walPath != "" {
+			if err := replayWAL(ctx, logger, ch, walPath); err != nil {
+				return err
+			}
+		}
+		return certStore.RebuildFrom(ch.GetBlocks())
 	}
 	if err != nil {
 		return err
@@ -41,20 +48,62 @@ func LoadChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, certSt
 	if err != nil {
 		return fmt.Errorf("restore chain: %w", err)
 	}
+
+	// Replay WAL entries on top of snapshot (CM-36)
+	if walPath != "" {
+		if err := replayWAL(ctx, logger, ch, walPath); err != nil {
+			return err
+		}
+	}
+
 	if replaced {
 		return certStore.RebuildFrom(ch.GetBlocks())
 	}
 	return nil
 }
 
-// SaveChain persists the chain's blocks to configDir/chain.json.
-func SaveChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, configDir string) error {
+func replayWAL(ctx context.Context, logger *slog.Logger, ch *chain.Chain, walPath string) error {
+	wal, err := chain.OpenWAL(walPath, logger, false)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open WAL: %w", err)
+	}
+	defer wal.Close()
+
+	return wal.Replay(func(b *chain.Block) error {
+		if err := ch.AddBlock(*b); err != nil {
+			logger.Warn("wal replay: skip block", "index", b.Index, "error", err)
+		}
+		return nil
+	})
+}
+
+// SaveChain persists the chain's blocks to configDir/chain.json and
+// rotates the WAL if walPath is provided.
+func SaveChain(ctx context.Context, logger *slog.Logger, ch *chain.Chain, configDir, walPath string) error {
 	data, err := json.Marshal(persistedChain{Blocks: ch.GetBlocks()})
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(configDir, "chain.json")
-	return os.WriteFile(path, data, 0600)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+
+	// Rotate WAL after successful snapshot (CM-36)
+	if walPath != "" {
+		wal, err := chain.OpenWAL(walPath, logger, false)
+		if err != nil {
+			return fmt.Errorf("open WAL for rotate: %w", err)
+		}
+		defer wal.Close()
+		if err := wal.Rotate(); err != nil {
+			return fmt.Errorf("rotate WAL: %w", err)
+		}
+	}
+	return nil
 }
 
 // LoadValidators loads the validator allowlist from the specified path.

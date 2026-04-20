@@ -1,4 +1,4 @@
-# certchain Failure Mode Tenets (CM-01 to CM-35)
+# certchain Failure Mode Tenets (CM-01 to CM-36)
 
 This document lists every identified failure mode for certchain. It is a
 **governing design document**: no code change, configuration choice, or
@@ -971,4 +971,34 @@ renewal is required.
 **Test:** TestScheduleRenewalTime table-driven unit tests verify delay
 computation; integration test with fake clock not provided but manual
 testing confirmed the full flow works in-cluster.
+
+---
+
+### CM-36 — Whole-File chain.json Rewrite Without WAL Loses Blocks on Crash Mid-Write
+
+**Risk:** The persisted chain snapshot is written by SaveChain as a complete
+replace of chain.json. If certd crashes during os.WriteFile or the OS/disk
+fails mid-write, chain.json can be truncated or torn, resulting in loss of
+all blocks committed since the previous snapshot. On restart, the chain
+reverts to the last consistent state, dropping transactions that clients
+already observed as confirmed (violates durability).
+
+**Mitigation:**
+- Write-ahead log (WAL) at <config-dir>/chain.wal (configurable via
+  --chain-wal-path) using length-prefixed CRC32-protected JSON records.
+- Every BatchSubmit/Submit appends the candidate block to the WAL with
+  fsync (configurable; default on) BEFORE appending to the in-memory
+  chain.blocks slice. If the WAL write fails, the block commit is aborted
+  and the caller receives an error.
+- On startup, LoadChain replays the WAL on top of the last chain.json
+  snapshot. Truncated tail records (short read when reading the length
+  prefix) are logged and skipped. CRC mismatches are logged and skipped
+  so partial writes do not crash the process.
+- After a successful SaveChain snapshot completes, the WAL is rotated
+  (truncated to zero length) so it doesn't grow unbounded.
+- The WAL format is: | len(4 LE) | crc32(4) | JSON payload |
+
+**Test:** TestWAL_AppendReplay, TestWAL_TruncatedTail, TestWAL_CRCMismatch,
+TestWAL_Rotate in internal/chain/wal_test.go verify record framing, replay
+correctness, and tail-truncation handling.
 

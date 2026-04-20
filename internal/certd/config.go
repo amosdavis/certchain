@@ -33,6 +33,7 @@ type Config struct {
 	AcceptLegacySigs         bool
 	BatchMaxTxs              int
 	BatchMaxWait             time.Duration
+	ChainWALPath             string
 }
 
 // ParseFlags parses command-line flags and environment variables
@@ -75,6 +76,9 @@ func ParseFlags(args []string) *Config {
 	)
 	fs.IntVar(&cfg.BatchMaxTxs, "batch-max-txs", defaultBatchMaxTxs, "maximum transactions committed in a single block by the chain.Batcher (CM-32)")
 	fs.DurationVar(&cfg.BatchMaxWait, "batch-max-wait", defaultBatchMaxWait, "maximum time the chain.Batcher will hold a partial batch before committing (CM-32)")
+
+	// CM-36: write-ahead log
+	fs.StringVar(&cfg.ChainWALPath, "chain-wal-path", "", "path to chain WAL file (default: <config-dir>/chain.wal)")
 
 	_ = fs.Parse(args)
 

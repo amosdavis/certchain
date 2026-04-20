@@ -62,10 +62,22 @@ func Run(ctx context.Context, cfg *Config) error {
 	ready := NewReadiness()
 	startMetricsServer(ctx, logger, cfg.MetricsAddr, registry, ready)
 
+	// CM-36: open WAL for crash-safe chain persistence
+	walPath := cfg.ChainWALPath
+	if walPath == "" {
+		walPath = filepath.Join(cfg.ConfigDir, "chain.wal")
+	}
+	wal, err := chain.OpenWAL(walPath, logger, true)
+	if err != nil {
+		return fmt.Errorf("open WAL: %w", err)
+	}
+	defer wal.Close()
+
 	ch := chain.New(
 		chain.WithChainID(cfg.ChainID),
 		chain.WithAcceptLegacySigs(cfg.AcceptLegacySigs),
 		chain.WithMetrics(registry),
+		chain.WithWAL(wal),
 	)
 	certStore := cert.NewStore(cfg.MaxCerts)
 	peerTable := peer.NewTable()
@@ -95,7 +107,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	// Load persisted chain if present.
-	if err := LoadChain(ctx, logger, ch, certStore, cfg.ConfigDir); err != nil {
+	if err := LoadChain(ctx, logger, ch, certStore, cfg.ConfigDir, walPath); err != nil {
 		log.Printf("certd: load chain: %v (starting fresh)", err)
 	}
 	// Even if load failed (fresh start), persisted-state replay has finished
@@ -118,7 +130,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	// blockSubmitter batches all block submissions (avxPollLoop + CSRWatcher)
 	// through chain.Batcher so bursts commit as a single multi-tx block and
 	// the per-node nonce stays monotonically increasing (CM-32).
-	bs := NewBlockSubmitter(ctx, logger, ch, certStore, id, syncer, cfg.ConfigDir, cfg.BatchMaxTxs, cfg.BatchMaxWait)
+	bs := NewBlockSubmitter(ctx, logger, ch, certStore, id, syncer, cfg.ConfigDir, walPath, cfg.BatchMaxTxs, cfg.BatchMaxWait)
 	defer bs.Stop()
 
 	// AppViewX client — shared between poll loop and K8s CSR watcher.
@@ -212,7 +224,7 @@ func Run(ctx context.Context, cfg *Config) error {
 			if err := certStore.RebuildFrom(ch.GetBlocks()); err != nil {
 				log.Printf("certd: cert store rebuild: %v", err)
 			}
-			if err := SaveChain(ctx, logger, ch, cfg.ConfigDir); err != nil {
+			if err := SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath); err != nil {
 				log.Printf("certd: save chain: %v", err)
 			}
 			triggerK8sSync()
@@ -265,7 +277,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	<-ctx.Done()
 	log.Println("certd: shutting down")
 
-	if err := SaveChain(ctx, logger, ch, cfg.ConfigDir); err != nil {
+	if err := SaveChain(ctx, logger, ch, cfg.ConfigDir, walPath); err != nil {
 		log.Printf("certd: save chain on shutdown: %v", err)
 	}
 

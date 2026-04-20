@@ -91,6 +91,14 @@ func (c *Chain) BatchSubmit(ctx context.Context, txs []Transaction) (Block, erro
 		return Block{}, errors.New("chain tip advanced during submit; retry")
 	}
 
+	// Write to WAL BEFORE in-memory commit (CM-36). If the WAL write
+	// fails, the block is not committed and the caller sees an error.
+	if c.wal != nil {
+		if err := c.wal.Append(&blk); err != nil {
+			return Block{}, err
+		}
+	}
+
 	c.applySeqAndRate(blk)
 	c.blocks = append(c.blocks, blk)
 	return blk, nil

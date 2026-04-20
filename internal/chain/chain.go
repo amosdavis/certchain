@@ -23,6 +23,7 @@ type Chain struct {
 	seqMap     map[[32]byte]uint32  // last seen nonce per node pubkey
 	rateMap    map[[32]byte][]int64 // block indices of recent txs per node
 	validators *ValidatorSet        // nil = accept any signer (CM-23)
+	wal        *WAL                 // write-ahead log for crash-safe persistence (CM-36)
 
 	// chainID and acceptLegacySigs reflect the signing context installed
 	// by New (CM-29). They are recorded here so callers can introspect
@@ -67,6 +68,14 @@ func WithMetrics(reg *metrics.Registry) Option {
 		}
 		counter := metrics.NewChainLegacySigCounter(reg)
 		SetLegacySigHook(func() { counter.Inc() })
+	}
+}
+
+// WithWAL installs a write-ahead log for crash-safe persistence (CM-36).
+// Pass nil to disable WAL (tests, or when persistence is not needed).
+func WithWAL(wal *WAL) Option {
+	return func(c *Chain) {
+		c.wal = wal
 	}
 }
 
